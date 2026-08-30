@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 from groq import Groq
 
@@ -9,6 +10,15 @@ from tools import (
     pipeline_summary,
     work_order_financials,
 )
+
+KNOWN_SECTORS = [
+    "Mining",
+    "Renewables",
+    "Railways",
+    "Powerline",
+    "Construction",
+    "Others",
+]
 
 SYSTEM_PROMPT = """
 You are the Skylark Drones Business Intelligence Agent.
@@ -78,6 +88,39 @@ IMPORTANT RULES:
 Do not expose internal tool names or implementation details
 unless the user asks about the architecture.
 """
+
+
+def detect_sector(question):
+    """
+    Detect an exact known sector from the user question.
+    Returns None if no unambiguous sector is present.
+    """
+
+    question_lower = question.lower()
+    matches = []
+
+    for sector in KNOWN_SECTORS:
+        if re.search(rf"\b{re.escape(sector.lower())}\b", question_lower):
+            matches.append(sector)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+def is_cross_reference_question(question):
+    q = question.lower()
+
+    comparison_words = ["compare", "comparison", "versus", "vs", "against"]
+    deal_words = ["deal", "pipeline"]
+    execution_words = ["work order", "work-order", "execution"]
+
+    has_comparison = any(word in q for word in comparison_words)
+    has_deal = any(word in q for word in deal_words)
+    has_execution = any(word in q for word in execution_words)
+
+    return has_comparison and has_deal and has_execution
 
 
 def create_agent(
@@ -196,17 +239,45 @@ def create_agent(
             "type": "function",
             "function": {
                 "name": "cross_reference_deal_to_execution",
-                "description": "Compare deal pipeline and work-order execution at sector level.",
+                "description": (
+                    "Compare deal pipeline and work-order execution for ONE SPECIFIC SECTOR. "
+                    "The sector argument is mandatory."
+                ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"sector": {"type": "string", "description": "Sector to compare."}},
-                    "required": [],
+                    "properties": {
+                        "sector": {
+                            "type": "string",
+                            "description": (
+                                "Required sector name, such as Mining, Renewables, Railways, "
+                                "Powerline, Construction, or Others."
+                            ),
+                        }
+                    },
+                    "required": ["sector"],
                 },
             },
         },
     ]
 
     def ask(question):
+        cross_reference = is_cross_reference_question(question)
+        sector = detect_sector(question)
+
+        if cross_reference and not sector:
+            return (
+                "Which sector should I compare? Available sectors are: Mining, Renewables, "
+                "Railways, Powerline, Construction, and Others."
+            )
+
+        if cross_reference and sector:
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "cross_reference_deal_to_execution"},
+            }
+        else:
+            tool_choice = "auto"
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question},
@@ -216,7 +287,7 @@ def create_agent(
             model="openai/gpt-oss-20b",
             messages=messages,
             tools=tools,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             temperature=0,
         )
 
@@ -230,6 +301,13 @@ def create_agent(
         for tool_call in message.tool_calls:
             name = tool_call.function.name
             arguments = json.loads(tool_call.function.arguments)
+
+            if name == "cross_reference_deal_to_execution":
+                detected_sector = detect_sector(question)
+                if detected_sector:
+                    arguments["sector"] = detected_sector
+                if not arguments.get("sector"):
+                    raise ValueError("Cross-board comparison requires a sector.")
 
             if name not in functions:
                 raise ValueError(f"Unknown tool requested: {name}")
@@ -248,8 +326,7 @@ def create_agent(
         final_response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=messages,
-            tools=tools,
-            tool_choice="auto",
+            tool_choice="none",
             temperature=0,
         )
 

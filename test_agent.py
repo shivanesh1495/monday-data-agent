@@ -38,9 +38,8 @@ def main():
         "How is our Mining pipeline looking?",
         "What are the financials for Mining work orders?",
         "Compare Mining deal pipeline with work-order execution.",
-        "How is our pipeline looking?",
+        "Compare deal pipeline with work-order execution.",
         "How much revenue do we have?",
-        "How are we doing in energy?",
     ]
 
     for i, question in enumerate(questions, start=1):
