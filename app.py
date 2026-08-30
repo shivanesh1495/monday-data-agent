@@ -168,6 +168,15 @@ if st.button("Generate Leadership Summary"):
     pipeline = summary["pipeline"]
     financials = summary["work_orders"]
 
+    deal_missing = build_quality_summary(deals)["missing_values"]
+    work_missing = build_quality_summary(work_orders)["missing_values"]
+
+    def missing_count(summary_map, *keys):
+        for key in keys:
+            if key in summary_map:
+                return int(summary_map[key])
+        return 0
+
     markdown = f"""
 # Leadership Summary
 
@@ -192,17 +201,27 @@ if st.button("Generate Leadership Summary"):
 
 ## Data Quality
 
-- Metrics are calculated from live monday.com data.
-- Missing source values were not artificially populated.
-- Where numeric calculations require values, missing
-  numeric fields are treated as zero by the BI calculation.
-- Date and status fields remain missing when unavailable.
+### Deals
+- {len(deals)} total records
+- Close Date missing in {missing_count(deal_missing, 'Close Date (A)')} records
+- Closure Probability missing in {missing_count(deal_missing, 'Closure Probability')} records
+- No values were imputed
+
+### Work Orders
+- {len(work_orders)} total records
+- Expected Billing Month missing in {missing_count(work_missing, 'Expected Billing Month')} records
+- Actual Collection Month missing in {missing_count(work_missing, 'Actual Collection Month')} records
+- Collection Status missing in {missing_count(work_missing, 'Collection status')} records
+- Collection Date missing in {missing_count(work_missing, 'Collection Date')} records
+- No values were imputed
+
+> On-hold deal value: ₹{pipeline["on_hold_value"]:,.2f} based on available deal-value data; missing deal values were not imputed.
 """
 
     st.markdown(markdown)
 
     st.download_button(
-        label="Copy / Download Markdown",
+        label="Download Markdown",
         data=markdown,
         file_name="leadership_summary.md",
         mime="text/markdown"
