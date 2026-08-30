@@ -122,6 +122,62 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIn("Railways deal pipeline", result)
         self.assertNotIn("Which sector", result)
 
+    @patch("agent.pipeline_summary")
+    def test_compares_win_rate_between_sectors(self, mock_pipeline):
+        mock_pipeline.side_effect = [
+            {
+                "deal_count": 10,
+                "total_deal_value": 1000,
+                "open_deals": 4,
+                "won_value": 300,
+                "on_hold_value": 100,
+                "dead_value": 200,
+                "won_deals": 5,
+            },
+            {
+                "deal_count": 8,
+                "total_deal_value": 800,
+                "open_deals": 3,
+                "won_value": 160,
+                "on_hold_value": 50,
+                "dead_value": 240,
+                "won_deals": 2,
+            },
+        ]
+
+        result = self.ask("Compare win rate between Mining and Renewables.")
+
+        self.assertIn("Sector comparison - Win rate", result)
+        self.assertIn("Mining: 50.0%", result)
+        self.assertIn("Renewables: 25.0%", result)
+
+    @patch("agent.work_order_financials")
+    def test_compares_collections_between_sectors(self, mock_work_orders):
+        mock_work_orders.side_effect = [
+            {
+                "work_order_count": 3,
+                "total_order_value": 1000,
+                "billed_value": 700,
+                "collected_amount": 500,
+                "amount_to_be_billed": 200,
+                "amount_receivable": 300,
+            },
+            {
+                "work_order_count": 2,
+                "total_order_value": 900,
+                "billed_value": 600,
+                "collected_amount": 450,
+                "amount_to_be_billed": 150,
+                "amount_receivable": 250,
+            },
+        ]
+
+        result = self.ask("Compare collections between Railways and Powerline.")
+
+        self.assertIn("Sector comparison - Collected amount", result)
+        self.assertIn("Railways: 500.00", result)
+        self.assertIn("Powerline: 450.00", result)
+
 
 if __name__ == "__main__":
     unittest.main()

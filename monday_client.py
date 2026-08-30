@@ -7,6 +7,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -15,31 +17,90 @@ API_URL = "https://api.monday.com/v2"
 
 class MondayClient:
 
-    def __init__(self):
+    def __init__(self, timeout=30, session=None):
         self.token = os.getenv("MONDAY_API_TOKEN")
 
         if not self.token:
             raise ValueError("MONDAY_API_TOKEN is missing")
 
+        self.timeout = timeout
         self.headers = {
             "Authorization": self.token,
             "Content-Type": "application/json",
         }
+        self.session = session or self._build_session()
+
+    def _build_session(self):
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _format_errors(self, errors):
+        formatted = []
+        for error in errors:
+            if isinstance(error, dict):
+                message = error.get("message") or str(error)
+                path = error.get("path")
+                code = error.get("extensions", {}).get("code")
+                details = []
+                if code:
+                    details.append(f"code={code}")
+                if path:
+                    details.append(f"path={'.'.join(str(part) for part in path)}")
+                if details:
+                    formatted.append(f"{message} ({', '.join(details)})")
+                else:
+                    formatted.append(message)
+            else:
+                formatted.append(str(error))
+        return "; ".join(formatted)
 
     def _request(self, query):
-        response = requests.post(
-            API_URL,
-            headers=self.headers,
-            json={"query": query},
-            timeout=30,
-        )
+        try:
+            response = self.session.post(
+                API_URL,
+                headers=self.headers,
+                json={"query": query},
+                timeout=self.timeout,
+            )
+        except requests.Timeout as exc:
+            raise RuntimeError(
+                "Timed out while querying monday.com. Please try again."
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Could not reach monday.com: {exc}"
+            ) from exc
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            body_preview = response.text[:300]
+            raise RuntimeError(
+                f"monday.com API returned HTTP {response.status_code}: {body_preview}"
+            ) from exc
 
         result = response.json()
 
         if "errors" in result:
-            raise RuntimeError(result["errors"])
+            raise RuntimeError(
+                f"monday.com query failed: {self._format_errors(result['errors'])}"
+            )
+
+        if "data" not in result:
+            raise RuntimeError("monday.com API response did not include a data payload")
 
         return result["data"]
 

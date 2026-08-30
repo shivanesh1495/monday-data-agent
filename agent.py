@@ -20,6 +20,81 @@ KNOWN_SECTORS = [
     "Others",
 ]
 
+METRIC_DEFINITIONS = {
+    "win_rate": {
+        "aliases": ["win rate", "conversion", "conversion rate", "close rate"],
+        "domain": "pipeline",
+        "label": "Win rate",
+        "format": "percent",
+    },
+    "total_deal_value": {
+        "aliases": ["deal value", "pipeline value", "deal pipeline", "pipeline"],
+        "domain": "pipeline",
+        "label": "Total deal value",
+        "format": "money",
+    },
+    "active_pipeline_value": {
+        "aliases": ["active pipeline", "open pipeline", "pipeline health"],
+        "domain": "pipeline",
+        "label": "Active pipeline value",
+        "format": "money",
+    },
+    "won_value": {
+        "aliases": ["won value", "won deals", "booked deals"],
+        "domain": "pipeline",
+        "label": "Won value",
+        "format": "money",
+    },
+    "dead_value": {
+        "aliases": ["dead value", "lost deals", "dropped deals"],
+        "domain": "pipeline",
+        "label": "Dead value",
+        "format": "money",
+    },
+    "on_hold_value": {
+        "aliases": ["on hold", "on-hold"],
+        "domain": "pipeline",
+        "label": "On-hold value",
+        "format": "money",
+    },
+    "total_order_value": {
+        "aliases": ["order book", "work order value", "execution value", "total order value"],
+        "domain": "work_order",
+        "label": "Total order value",
+        "format": "money",
+    },
+    "billed_value": {
+        "aliases": ["billed", "billing", "billed value", "invoiced"],
+        "domain": "work_order",
+        "label": "Billed value",
+        "format": "money",
+    },
+    "collected_amount": {
+        "aliases": ["collected", "collections", "cash collected", "receipts"],
+        "domain": "work_order",
+        "label": "Collected amount",
+        "format": "money",
+    },
+    "amount_receivable": {
+        "aliases": ["receivable", "receivables", "outstanding"],
+        "domain": "work_order",
+        "label": "Amount receivable",
+        "format": "money",
+    },
+    "amount_to_be_billed": {
+        "aliases": ["to be billed", "unbilled", "pending billing"],
+        "domain": "work_order",
+        "label": "Amount to be billed",
+        "format": "money",
+    },
+    "work_order_count": {
+        "aliases": ["work order count", "work orders", "execution count"],
+        "domain": "work_order",
+        "label": "Work orders",
+        "format": "count",
+    },
+}
+
 SYSTEM_PROMPT = """
 You are the Skylark Drones Business Intelligence Agent.
 
@@ -133,6 +208,25 @@ def detect_time_window(question):
     return None
 
 
+def detect_metric(question):
+    """Extract a known metric from the user question."""
+
+    question_lower = question.lower()
+    for metric, config in METRIC_DEFINITIONS.items():
+        if any(alias in question_lower for alias in config["aliases"]):
+            return metric
+
+    return None
+
+
+def metric_definition(metric):
+    return METRIC_DEFINITIONS.get(metric)
+
+
+def is_all_sectors_question(question):
+    return bool(re.search(r"\ball\s+sectors?\b", question.lower()))
+
+
 def is_cross_reference_question(question):
     q = question.lower()
 
@@ -153,6 +247,31 @@ def is_metric_ambiguity(question):
         term in question_lower
         for term in ["deal value", "billed", "collected", "receivable"]
     )
+
+
+def is_sector_metric_comparison_question(question):
+    q = question.lower()
+    has_comparison = bool(re.search(r"\bcompare\b|\bcomparison\b|\bversus\b|\bvs\b|\bagainst\b", q))
+    return has_comparison and len(detect_sectors(question)) >= 2 and not is_cross_reference_question(question)
+
+
+def format_metric_value(value, kind):
+    if kind == "percent":
+        return f"{value:.1f}%"
+    if kind == "count":
+        return str(int(value))
+    return f"{value:,.2f}"
+
+
+def metric_value_from_summary(metric, summary):
+    data = summary["result"]
+
+    if metric == "win_rate":
+        deal_count = data.get("deal_count", 0)
+        won_deals = data.get("won_deals", 0)
+        return ((won_deals / deal_count) * 100) if deal_count else 0.0
+
+    return float(data.get(metric, 0))
 
 
 def format_cross_reference_result(payloads, time_window=None):
@@ -190,6 +309,45 @@ def format_cross_reference_result(payloads, time_window=None):
     return "\n".join(lines)
 
 
+def format_sector_metric_comparison(payloads, metric, domain, time_window=None):
+    definition = metric_definition(metric)
+    label = definition["label"] if definition else metric.replace("_", " ").title()
+    value_kind = definition["format"] if definition else "money"
+    lines = [f"Sector comparison - {label}"]
+
+    if time_window:
+        lines.append(
+            f"Requested time window: {time_window.replace('_', ' ')}. "
+            "Historical time filtering is not available in the current board tools, "
+            "so the figures below reflect the current normalized board state."
+        )
+
+    scored = []
+    for payload in payloads:
+        sector = payload["sector"]
+        summary = payload["summary"]
+        value = metric_value_from_summary(metric, summary)
+        scored.append((sector, value))
+        lines.append(f"- {sector}: {format_metric_value(value, value_kind)}")
+
+    if len(scored) >= 2:
+        leader, leader_value = max(scored, key=lambda item: item[1])
+        trailer, trailer_value = min(scored, key=lambda item: item[1])
+        delta = leader_value - trailer_value
+        lines.extend(
+            [
+                "",
+                f"Interpretation: {leader} leads on {label.lower()} by {format_metric_value(delta, value_kind)} versus {trailer}.",
+                (
+                    "Data quality: missing values were not imputed; incomplete board fields may affect this "
+                    f"{domain.replace('_', '-')} comparison."
+                ),
+            ]
+        )
+
+    return "\n".join(lines)
+
+
 def detect_direct_business_question(question):
     """Return a deterministic BI instruction for common direct questions."""
     q = question.lower()
@@ -199,7 +357,8 @@ def detect_direct_business_question(question):
     if re.search(r"\bcompare\b|\bcomparison\b|\bversus\b|\bvs\b|\bagainst\b", q):
         return None
 
-    sector = detect_sector(question)
+    sector = None if is_all_sectors_question(question) else detect_sector(question)
+    metric = detect_metric(question)
 
     pipeline_keywords = [
         "deal pipeline",
@@ -207,6 +366,10 @@ def detect_direct_business_question(question):
         "deal value",
         "deal volume",
         "deal summary",
+        "win rate",
+        "won deals",
+        "open deals",
+        "on hold",
     ]
     execution_keywords = [
         "work order",
@@ -214,18 +377,27 @@ def detect_direct_business_question(question):
         "work order execution",
         "execution value",
         "work order value",
+        "collections",
+        "collected",
+        "billing",
+        "billed",
+        "receivable",
+        "order book",
     ]
 
+    if metric:
+        return {"kind": metric_definition(metric)["domain"], "sector": sector, "metric": metric}
+
     if any(keyword in q for keyword in execution_keywords):
-        return {"kind": "work_order", "sector": sector}
+        return {"kind": "work_order", "sector": sector, "metric": None}
 
     if any(keyword in q for keyword in pipeline_keywords):
-        return {"kind": "pipeline", "sector": sector}
+        return {"kind": "pipeline", "sector": sector, "metric": None}
 
     return None
 
 
-def format_direct_business_result(kind, sector, summary, time_window=None):
+def format_direct_business_result(kind, sector, summary, time_window=None, metric=None):
     """Render a concise deterministic result for a single-sector BI question."""
     time_window_note = ""
     if time_window:
@@ -235,11 +407,23 @@ def format_direct_business_result(kind, sector, summary, time_window=None):
             "so the figures below reflect the current normalized board state.\n"
         )
 
+    if metric:
+        definition = metric_definition(metric)
+        value = metric_value_from_summary(metric, summary)
+        focus_line = (
+            f"- {definition['label']}: {format_metric_value(value, definition['format'])}\n"
+            if definition
+            else ""
+        )
+    else:
+        focus_line = ""
+
     if kind == "pipeline":
         data = summary["result"]
         return (
             f"{sector or 'All sectors'} deal pipeline\n"
             f"{time_window_note}"
+            f"{focus_line}"
             f"- Deals: {data['deal_count']}\n"
             f"- Total deal value: {data['total_deal_value']:,.2f}\n"
             f"- Open deals: {data['open_deals']}\n"
@@ -253,6 +437,7 @@ def format_direct_business_result(kind, sector, summary, time_window=None):
     return (
         f"{sector or 'All sectors'} work-order execution\n"
         f"{time_window_note}"
+        f"{focus_line}"
         f"- Work orders: {data['work_order_count']}\n"
         f"- Total order value: {data['total_order_value']:,.2f}\n"
         f"- Billed value: {data['billed_value']:,.2f}\n"
@@ -431,6 +616,7 @@ def create_agent(
     def empty_conversation_state():
         return {
             "task": None,
+            "domain": None,
             "sectors": [],
             "comparison": None,
             "metric": None,
@@ -447,7 +633,7 @@ def create_agent(
         conversation_state.update(empty_conversation_state())
         conversation_state["last_completed_task"] = completed
 
-    def remember_active_context(sectors=None, time_window=None):
+    def remember_active_context(sectors=None, time_window=None, metric=None):
         for sector in sectors or []:
             if sector not in conversation_state["sectors"]:
                 conversation_state["sectors"].append(sector)
@@ -456,22 +642,38 @@ def create_agent(
             conversation_state["time_window"] = time_window
             conversation_state["awaiting"] = None
 
+        if metric and not conversation_state["metric"]:
+            conversation_state["metric"] = metric
+
     def start_cross_reference_task(sectors=None, time_window=None):
         reset_active_task()
         conversation_state["task"] = "cross_reference"
+        conversation_state["domain"] = "cross_reference"
         conversation_state["comparison"] = "deal pipeline vs work-order execution"
         conversation_state["metric"] = conversation_state["comparison"]
         remember_active_context(sectors=sectors, time_window=time_window)
 
-    def start_direct_task(kind, sectors=None, time_window=None):
+    def start_direct_task(kind, sectors=None, time_window=None, metric=None):
         reset_active_task()
         conversation_state["task"] = kind
+        conversation_state["domain"] = kind
         conversation_state["metric"] = kind
-        remember_active_context(sectors=sectors, time_window=time_window)
+        if metric:
+            conversation_state["metric"] = metric
+        remember_active_context(sectors=sectors, time_window=time_window, metric=metric)
+
+    def start_sector_comparison_task(domain, metric=None, sectors=None, time_window=None):
+        reset_active_task()
+        conversation_state["task"] = "sector_comparison"
+        conversation_state["domain"] = domain
+        conversation_state["comparison"] = "sector versus sector"
+        conversation_state["metric"] = metric
+        remember_active_context(sectors=sectors, time_window=time_window, metric=metric)
 
     def finish_active_task():
         conversation_state["last_completed_task"] = {
             "task": conversation_state["task"],
+            "domain": conversation_state["domain"],
             "sectors": list(conversation_state["sectors"]),
             "comparison": conversation_state["comparison"],
             "metric": conversation_state["metric"],
@@ -507,6 +709,25 @@ def create_agent(
             sector,
             summary,
             time_window=conversation_state["time_window"],
+            metric=conversation_state["metric"] if conversation_state["metric"] != conversation_state["task"] else None,
+        )
+        finish_active_task()
+        return answer
+
+    def run_sector_comparison_task():
+        payloads = []
+        for sector in conversation_state["sectors"]:
+            if conversation_state["domain"] == "pipeline":
+                summary = tool_pipeline_summary(sector=sector)
+            else:
+                summary = tool_work_order_financials(sector=sector)
+            payloads.append({"sector": sector, "summary": summary})
+
+        answer = format_sector_metric_comparison(
+            payloads,
+            conversation_state["metric"],
+            conversation_state["domain"],
+            time_window=conversation_state["time_window"],
         )
         finish_active_task()
         return answer
@@ -515,24 +736,38 @@ def create_agent(
         question_lower = question.lower()
         current_sectors = detect_sectors(question)
         time_window = detect_time_window(question)
+        metric = detect_metric(question)
 
         direct_question = detect_direct_business_question(question)
-        if direct_question:
+        if is_sector_metric_comparison_question(question):
+            domain = metric_definition(metric)["domain"] if metric else None
+            start_sector_comparison_task(
+                domain=domain,
+                metric=metric,
+                sectors=current_sectors,
+                time_window=time_window,
+            )
+        elif direct_question:
             start_direct_task(
                 direct_question["kind"],
                 sectors=current_sectors,
                 time_window=time_window,
+                metric=direct_question.get("metric"),
             )
+
+        if direct_question:
+            pass
 
         if is_cross_reference_question(question):
             start_cross_reference_task(
                 sectors=current_sectors,
                 time_window=time_window,
             )
-        elif conversation_state["task"] in {"pipeline", "work_order", "cross_reference"}:
+        elif conversation_state["task"] in {"pipeline", "work_order", "cross_reference", "sector_comparison"}:
             remember_active_context(
                 sectors=current_sectors,
                 time_window=time_window,
+                metric=metric,
             )
 
         if is_metric_ambiguity(question):
@@ -543,7 +778,7 @@ def create_agent(
             )
 
         if conversation_state["task"] in {"pipeline", "work_order"}:
-            if not conversation_state["sectors"]:
+            if not conversation_state["sectors"] and not is_all_sectors_question(question):
                 conversation_state["awaiting"] = "sector"
                 return (
                     "Which sector should I use? Available sectors are: Mining, Renewables, "
@@ -553,8 +788,26 @@ def create_agent(
             conversation_state["awaiting"] = None
             return run_direct_task()
 
+        if conversation_state["task"] == "sector_comparison":
+            if not conversation_state["metric"]:
+                conversation_state["awaiting"] = "metric"
+                return (
+                    "Which metric should I compare: pipeline, win rate, billed, collected, "
+                    "receivable, or work-order value?"
+                )
+
+            if len(conversation_state["sectors"]) < 2:
+                conversation_state["awaiting"] = "sector"
+                return (
+                    "Which sectors should I compare? Available sectors are: Mining, Renewables, "
+                    "Railways, Powerline, Construction, and Others."
+                )
+
+            conversation_state["awaiting"] = None
+            return run_sector_comparison_task()
+
         if conversation_state["task"] == "cross_reference":
-            if re.search(r"\ball\s+sectors?\b", question_lower):
+            if is_all_sectors_question(question):
                 conversation_state["awaiting"] = "sector"
                 return (
                     "I can compare sectors individually. Which sectors would you like me "
@@ -597,6 +850,8 @@ def create_agent(
                 "Remembered time window: "
                 + conversation_state["time_window"].replace("_", " ")
             )
+        if conversation_state["domain"]:
+            context_lines.append(f"Remembered domain: {conversation_state['domain']}")
         if conversation_state["awaiting"]:
             context_lines.append(
                 f"Outstanding clarification: {conversation_state['awaiting']}"
