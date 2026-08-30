@@ -162,7 +162,8 @@ def format_cross_reference_result(payloads, time_window=None):
     if time_window:
         lines.append(
             f"Requested time window: {time_window.replace('_', ' ')}. "
-            "The current board tools return all available normalized records."
+            "Historical time filtering is not available in the current board tools, "
+            "so the figures below reflect the current normalized board state."
         )
 
     for payload in payloads:
@@ -224,29 +225,41 @@ def detect_direct_business_question(question):
     return None
 
 
-def format_direct_business_result(kind, sector, summary):
+def format_direct_business_result(kind, sector, summary, time_window=None):
     """Render a concise deterministic result for a single-sector BI question."""
+    time_window_note = ""
+    if time_window:
+        time_window_note = (
+            f"Requested time window: {time_window.replace('_', ' ')}. "
+            "Historical time filtering is not available in the current board tools, "
+            "so the figures below reflect the current normalized board state.\n"
+        )
+
     if kind == "pipeline":
         data = summary["result"]
         return (
             f"{sector or 'All sectors'} deal pipeline\n"
+            f"{time_window_note}"
             f"- Deals: {data['deal_count']}\n"
             f"- Total deal value: {data['total_deal_value']:,.2f}\n"
             f"- Open deals: {data['open_deals']}\n"
             f"- Won value: {data['won_value']:,.2f}\n"
             f"- On-hold value: {data['on_hold_value']:,.2f}\n"
-            f"- Dead value: {data['dead_value']:,.2f}"
+            f"- Dead value: {data['dead_value']:,.2f}\n"
+            "Data quality: missing values were not imputed; incomplete board fields may affect totals."
         )
 
     data = summary["result"]
     return (
         f"{sector or 'All sectors'} work-order execution\n"
+        f"{time_window_note}"
         f"- Work orders: {data['work_order_count']}\n"
         f"- Total order value: {data['total_order_value']:,.2f}\n"
         f"- Billed value: {data['billed_value']:,.2f}\n"
         f"- Collected amount: {data['collected_amount']:,.2f}\n"
         f"- Amount to be billed: {data['amount_to_be_billed']:,.2f}\n"
-        f"- Amount receivable: {data['amount_receivable']:,.2f}"
+        f"- Amount receivable: {data['amount_receivable']:,.2f}\n"
+        "Data quality: missing values were not imputed; incomplete board fields may affect totals."
     )
 
 
@@ -415,47 +428,112 @@ def create_agent(
         },
     ]
 
-    conversation_state = {
-        "sectors": [],
-        "comparison": None,
-        "metric": None,
-        "time_window": None,
-        "cross_reference_started": False,
-        "awaiting": None,
-    }
+    def empty_conversation_state():
+        return {
+            "task": None,
+            "sectors": [],
+            "comparison": None,
+            "metric": None,
+            "time_window": None,
+            "awaiting": None,
+            "last_completed_task": None,
+        }
+
+    conversation_state = empty_conversation_state()
+
+    def reset_active_task():
+        completed = conversation_state.get("last_completed_task")
+        conversation_state.clear()
+        conversation_state.update(empty_conversation_state())
+        conversation_state["last_completed_task"] = completed
+
+    def remember_active_context(sectors=None, time_window=None):
+        for sector in sectors or []:
+            if sector not in conversation_state["sectors"]:
+                conversation_state["sectors"].append(sector)
+
+        if time_window:
+            conversation_state["time_window"] = time_window
+            conversation_state["awaiting"] = None
+
+    def start_cross_reference_task(sectors=None, time_window=None):
+        reset_active_task()
+        conversation_state["task"] = "cross_reference"
+        conversation_state["comparison"] = "deal pipeline vs work-order execution"
+        conversation_state["metric"] = conversation_state["comparison"]
+        remember_active_context(sectors=sectors, time_window=time_window)
+
+    def start_direct_task(kind, sectors=None, time_window=None):
+        reset_active_task()
+        conversation_state["task"] = kind
+        conversation_state["metric"] = kind
+        remember_active_context(sectors=sectors, time_window=time_window)
+
+    def finish_active_task():
+        conversation_state["last_completed_task"] = {
+            "task": conversation_state["task"],
+            "sectors": list(conversation_state["sectors"]),
+            "comparison": conversation_state["comparison"],
+            "metric": conversation_state["metric"],
+            "time_window": conversation_state["time_window"],
+        }
+        reset_active_task()
+
+    def run_cross_reference_task():
+        payloads = [
+            tool_cross_reference(
+                sector=sector,
+                time_window=conversation_state["time_window"],
+            )
+            for sector in conversation_state["sectors"]
+        ]
+        answer = format_cross_reference_result(
+            payloads,
+            conversation_state["time_window"],
+        )
+        finish_active_task()
+        return answer
+
+    def run_direct_task():
+        sector = conversation_state["sectors"][0] if conversation_state["sectors"] else None
+
+        if conversation_state["task"] == "pipeline":
+            summary = tool_pipeline_summary(sector=sector)
+        else:
+            summary = tool_work_order_financials(sector=sector)
+
+        answer = format_direct_business_result(
+            conversation_state["task"],
+            sector,
+            summary,
+            time_window=conversation_state["time_window"],
+        )
+        finish_active_task()
+        return answer
 
     def ask(question):
         question_lower = question.lower()
         current_sectors = detect_sectors(question)
-        for sector in current_sectors:
-            if sector not in conversation_state["sectors"]:
-                conversation_state["sectors"].append(sector)
+        time_window = detect_time_window(question)
 
         direct_question = detect_direct_business_question(question)
         if direct_question:
-            sector = direct_question["sector"]
-            if not sector:
-                return (
-                    "Which sector should I compare? Available sectors are: Mining, Renewables, "
-                    "Railways, Powerline, Construction, and Others."
-                )
-
-            if direct_question["kind"] == "pipeline":
-                summary = tool_pipeline_summary(sector=sector)
-                return format_direct_business_result("pipeline", sector, summary)
-
-            if direct_question["kind"] == "work_order":
-                summary = tool_work_order_financials(sector=sector)
-                return format_direct_business_result("work_order", sector, summary)
+            start_direct_task(
+                direct_question["kind"],
+                sectors=current_sectors,
+                time_window=time_window,
+            )
 
         if is_cross_reference_question(question):
-            conversation_state["cross_reference_started"] = True
-            conversation_state["comparison"] = "deal pipeline vs work-order execution"
-            conversation_state["metric"] = conversation_state["comparison"]
-
-        time_window = detect_time_window(question)
-        if time_window:
-            conversation_state["time_window"] = time_window
+            start_cross_reference_task(
+                sectors=current_sectors,
+                time_window=time_window,
+            )
+        elif conversation_state["task"] in {"pipeline", "work_order", "cross_reference"}:
+            remember_active_context(
+                sectors=current_sectors,
+                time_window=time_window,
+            )
 
         if is_metric_ambiguity(question):
             conversation_state["awaiting"] = "metric"
@@ -464,7 +542,18 @@ def create_agent(
                 "or receivable?"
             )
 
-        if conversation_state["cross_reference_started"]:
+        if conversation_state["task"] in {"pipeline", "work_order"}:
+            if not conversation_state["sectors"]:
+                conversation_state["awaiting"] = "sector"
+                return (
+                    "Which sector should I use? Available sectors are: Mining, Renewables, "
+                    "Railways, Powerline, Construction, and Others."
+                )
+
+            conversation_state["awaiting"] = None
+            return run_direct_task()
+
+        if conversation_state["task"] == "cross_reference":
             if re.search(r"\ball\s+sectors?\b", question_lower):
                 conversation_state["awaiting"] = "sector"
                 return (
@@ -480,17 +569,11 @@ def create_agent(
                     "Railways, Powerline, Construction, and Others."
                 )
 
-            direct_specific_comparison = (
-                is_cross_reference_question(question)
-                and bool(current_sectors)
-                and not re.search(r"\btime\s+frame\b|\btimeframe\b|\bperiod\b", question_lower)
-            )
+            if len(conversation_state["sectors"]) > 1 and not conversation_state["time_window"]:
+                conversation_state["awaiting"] = None
+                return run_cross_reference_task()
 
-            if (
-                not conversation_state["time_window"]
-                and not direct_specific_comparison
-                and conversation_state["sectors"]
-            ):
+            if len(conversation_state["sectors"]) == 1 and not conversation_state["time_window"]:
                 conversation_state["awaiting"] = "time_window"
                 return "What time period should I use?"
 
@@ -498,24 +581,40 @@ def create_agent(
                 return "What time period should I use?"
 
             conversation_state["awaiting"] = None
-            payloads = [
-                tool_cross_reference(
-                    sector=sector,
-                    time_window=conversation_state["time_window"],
-                )
-                for sector in conversation_state["sectors"]
-            ]
-            return format_cross_reference_result(
-                payloads,
-                conversation_state["time_window"],
-            )
+            return run_cross_reference_task()
 
         tool_choice = "auto"
 
+        context_lines = []
+        if conversation_state["task"]:
+            context_lines.append(f"Active task: {conversation_state['task']}")
+        if conversation_state["sectors"]:
+            context_lines.append(
+                "Remembered sectors: " + ", ".join(conversation_state["sectors"])
+            )
+        if conversation_state["time_window"]:
+            context_lines.append(
+                "Remembered time window: "
+                + conversation_state["time_window"].replace("_", " ")
+            )
+        if conversation_state["awaiting"]:
+            context_lines.append(
+                f"Outstanding clarification: {conversation_state['awaiting']}"
+            )
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
         ]
+
+        if context_lines:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Conversation context:\n" + "\n".join(context_lines),
+                }
+            )
+
+        messages.append({"role": "user", "content": question})
 
         response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
