@@ -1451,6 +1451,32 @@ st.markdown(
 prompt_to_run = None
 summary_warning = None
 
+leadership_summary_clicked = st.button(
+    "Leadership Summary",
+    use_container_width=True,
+)
+
+if leadership_summary_clicked:
+    if live_data:
+        st.session_state.show_summary_panel = True
+        st.session_state.leadership_summary_markdown = build_summary_markdown(
+            summary=summary,
+            deals_df=deals,
+            work_orders_df=work_orders,
+            deal_quality=deal_quality,
+            work_quality=work_quality,
+        )
+    else:
+        summary_warning = (
+            "Live monday.com data is unavailable, so the leadership summary cannot be generated yet."
+        )
+
+if summary_warning:
+    st.markdown(
+        f"<div class='notice-card'><strong>Summary notice.</strong> {escape_copy(summary_warning)}</div>",
+        unsafe_allow_html=True,
+    )
+
 if st.session_state.show_summary_panel and live_data:
     st.markdown(
         build_summary_html(
