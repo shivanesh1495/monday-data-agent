@@ -213,7 +213,7 @@ def create_agent(
         ]
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -246,11 +246,37 @@ def create_agent(
             )
 
         final_response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=messages,
+            tools=tools,
+            tool_choice="auto",
             temperature=0,
         )
 
-        return final_response.choices[0].message.content
+        final_message = final_response.choices[0].message
+        content = final_message.content
+
+        if content is not None and content.strip():
+            return content
+
+        if messages and messages[-1].get("role") == "tool":
+            tool_payload = json.loads(messages[-1]["content"])
+            result = tool_payload.get("result", tool_payload)
+            sector = result.get("sector", "All sectors")
+            pipeline = result.get("pipeline", {})
+            execution = result.get("execution", {})
+            comparison = result.get("comparison", {})
+
+            return (
+                f"{sector} sector comparison: "
+                f"deal pipeline value is {pipeline.get('total_pipeline_value', 0):,.2f}, "
+                f"while work-order value is {execution.get('total_order_value', 0):,.2f}. "
+                f"This is a sector-level comparison, not a direct one-to-one deal-to-work-order match. "
+                f"Current counts are {comparison.get('pipeline_deal_count', 0)} deals versus "
+                f"{comparison.get('work_order_count', 0)} work orders. "
+                "Data quality caveats still apply because missing values were not imputed."
+            )
+
+        return "I could not produce a reliable answer from the available business data."
 
     return ask
