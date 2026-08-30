@@ -10,6 +10,7 @@ from normalize import (
 )
 
 from agent import create_agent
+from tools import leadership_summary
 
 st.set_page_config(
     page_title="Skylark BI Agent",
@@ -148,6 +149,64 @@ for message in st.session_state.messages:
         st.markdown(
             message["content"]
         )
+
+# -----------------------------
+# Leadership Summary
+# -----------------------------
+
+st.divider()
+
+st.subheader("Leadership Summary")
+
+if st.button("Generate Leadership Summary"):
+
+    summary = leadership_summary(
+        deals,
+        work_orders
+    )
+
+    pipeline = summary["pipeline"]
+    financials = summary["work_orders"]
+
+    markdown = f"""
+# Leadership Summary
+
+## Deal Pipeline
+
+- Total deals: {pipeline["deal_count"]}
+- Total deal value: ₹{pipeline["total_deal_value"]:,.2f}
+- Active pipeline value: ₹{pipeline["active_pipeline_value"]:,.2f}
+- Open deals: {pipeline["open_deals"]}
+- Won value: ₹{pipeline["won_value"]:,.2f}
+- Dead value: ₹{pipeline["dead_value"]:,.2f}
+- On-hold value: ₹{pipeline["on_hold_value"]:,.2f}
+
+## Work Orders
+
+- Work orders: {financials["work_order_count"]}
+- Total order value: ₹{financials["total_order_value"]:,.2f}
+- Billed value: ₹{financials["billed_value"]:,.2f}
+- Collected amount: ₹{financials["collected_amount"]:,.2f}
+- Amount to be billed: ₹{financials["amount_to_be_billed"]:,.2f}
+- Amount receivable: ₹{financials["amount_receivable"]:,.2f}
+
+## Data Quality
+
+- Metrics are calculated from live monday.com data.
+- Missing source values were not artificially populated.
+- Where numeric calculations require values, missing
+  numeric fields are treated as zero by the BI calculation.
+- Date and status fields remain missing when unavailable.
+"""
+
+    st.markdown(markdown)
+
+    st.download_button(
+        label="Copy / Download Markdown",
+        data=markdown,
+        file_name="leadership_summary.md",
+        mime="text/markdown"
+    )
 
 # -----------------------------
 # Chat input

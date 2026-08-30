@@ -346,18 +346,20 @@ def create_agent(
                 }
             )
 
-        final_response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=messages,
-            tool_choice="none",
-            temperature=0,
-        )
+        try:
+            final_response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=messages,
+                temperature=0,
+            )
 
-        final_message = final_response.choices[0].message
-        content = final_message.content
+            final_message = final_response.choices[0].message
+            content = final_message.content
 
-        if content is not None and content.strip():
-            return content
+            if content is not None and content.strip():
+                return content
+        except Exception:
+            pass
 
         if messages and messages[-1].get("role") == "tool":
             tool_payload = json.loads(messages[-1]["content"])
@@ -369,7 +371,7 @@ def create_agent(
 
             return (
                 f"{sector} sector comparison: "
-                f"deal pipeline value is {pipeline.get('total_pipeline_value', 0):,.2f}, "
+                f"deal pipeline value is {pipeline.get('total_deal_value', 0):,.2f}, "
                 f"while work-order value is {execution.get('total_order_value', 0):,.2f}. "
                 f"This is a sector-level comparison, not a direct one-to-one deal-to-work-order match. "
                 f"Current counts are {comparison.get('pipeline_deal_count', 0)} deals versus "

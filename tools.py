@@ -69,7 +69,11 @@ def pipeline_summary(deals_df, sector=None):
     if df.empty:
         return {
             "deal_count": 0,
-            "total_pipeline_value": 0,
+            "total_deal_value": 0,
+            "active_pipeline_value": 0,
+            "won_value": 0,
+            "dead_value": 0,
+            "on_hold_value": 0,
             "open_deals": 0,
             "won_deals": 0,
             "dead_deals": 0,
@@ -80,13 +84,24 @@ def pipeline_summary(deals_df, sector=None):
 
     status = df["Deal Status"].astype(str).str.strip().str.lower()
 
+    open_mask = status == "open"
+    won_mask = status == "won"
+    dead_mask = status == "dead"
+    hold_mask = status == "on hold"
+
     return {
         "deal_count": len(df),
-        "total_pipeline_value": float(value.fillna(0).sum()),
-        "open_deals": int((status == "open").sum()),
-        "won_deals": int((status == "won").sum()),
-        "dead_deals": int((status == "dead").sum()),
-        "on_hold_deals": int((status == "on hold").sum()),
+        "total_deal_value": float(value.fillna(0).sum()),
+        "active_pipeline_value": float(
+            value[open_mask | hold_mask].fillna(0).sum()
+        ),
+        "won_value": float(value[won_mask].fillna(0).sum()),
+        "dead_value": float(value[dead_mask].fillna(0).sum()),
+        "on_hold_value": float(value[hold_mask].fillna(0).sum()),
+        "open_deals": int(open_mask.sum()),
+        "won_deals": int(won_mask.sum()),
+        "dead_deals": int(dead_mask.sum()),
+        "on_hold_deals": int(hold_mask.sum()),
     }
 
 
@@ -183,7 +198,22 @@ def cross_reference_deal_to_execution(
         "comparison": {
             "pipeline_deal_count": deal_data["deal_count"],
             "work_order_count": work_data["work_order_count"],
-            "pipeline_value": deal_data["total_pipeline_value"],
+            "pipeline_value": deal_data["total_deal_value"],
             "executed_order_value": work_data["total_order_value"],
         },
+    }
+
+
+def leadership_summary(deals_df, work_orders_df):
+    """
+    Generate a concise leadership summary using
+    deterministic BI calculations.
+    """
+
+    pipeline = pipeline_summary(deals_df)
+    financials = work_order_financials(work_orders_df)
+
+    return {
+        "pipeline": pipeline,
+        "work_orders": financials
     }
