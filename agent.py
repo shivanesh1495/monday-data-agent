@@ -123,6 +123,28 @@ def is_cross_reference_question(question):
     return has_comparison and has_deal and has_execution
 
 
+def compact_quality_summary(summary):
+    """
+    Reduce quality information size for Groq context.
+    Only include row count and fields with missing values.
+    """
+    if not summary:
+        return {}
+
+    missing = summary.get("missing_values", {})
+
+    important = {
+        column: count
+        for column, count in missing.items()
+        if count > 0
+    }
+
+    return {
+        "row_count": summary.get("row_count"),
+        "important_missing_fields": important
+    }
+
+
 def create_agent(
     deals_df,
     work_orders_df,
@@ -137,8 +159,8 @@ def create_agent(
     client = Groq(api_key=api_key)
 
     quality_context = {
-        "work_orders": work_order_quality or {},
-        "deals": deal_quality or {},
+        "work_orders": compact_quality_summary(work_order_quality),
+        "deals": compact_quality_summary(deal_quality),
     }
 
     def tool_filter_deals(sector=None, status=None, stage=None, owner=None):
@@ -152,7 +174,8 @@ def create_agent(
 
         return {
             "row_count": len(result),
-            "data": result.to_dict(orient="records"),
+            "columns": list(result.columns),
+            "sample": result.head(10).to_dict(orient="records"),
             "quality": quality_context["deals"],
         }
 
