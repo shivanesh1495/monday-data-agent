@@ -1,4 +1,5 @@
 import os
+import re
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
@@ -7,6 +8,15 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 from datetime import date, timedelta
 
 import pandas as pd
+
+CANONICAL_SECTORS = [
+    "Mining",
+    "Renewables",
+    "Railways",
+    "Powerline",
+    "Construction",
+    "Others",
+]
 
 
 def resolve_column(df, candidates, required=True):
@@ -66,7 +76,37 @@ WORK_ORDER_COLUMN_ALIASES = {
     "execution_date": ["Data Delivery Date", "Probable End Date", "Probable Start Date"],
     "invoice_date": ["Last invoice date", "Expected Billing Month", "Actual Billing Month"],
     "collection_date": ["Collection Date", "Actual Collection Month", "Last invoice date"],
+    "billing_status": ["Billing Status", "Invoice Status", "WO Status (billed)"],
 }
+
+
+def normalize_sector_name(value):
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    mapping = {sector.lower(): sector for sector in CANONICAL_SECTORS}
+    mapping["renewable"] = "Renewables"
+    return mapping.get(text.lower())
+
+
+def normalize_client_code(value):
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip().upper()
+    if not text:
+        return None
+
+    digits = re.search(r"(\d+)$", text)
+    if digits:
+        return digits.group(1).zfill(3)
+
+    collapsed = re.sub(r"[^A-Z0-9]", "", text)
+    return collapsed or None
 
 
 def current_reference_date():
@@ -466,4 +506,371 @@ def leadership_summary(deals_df, work_orders_df):
     return {
         "pipeline": pipeline,
         "work_orders": financials
+    }
+
+
+def average_deal_size(deals_df, sector=None):
+    """Return average and coverage details for recorded deal values."""
+
+    df = filter_deals(deals_df, sector=sector)
+    value_column = resolve_column(df, DEAL_COLUMN_ALIASES["value"])
+    values = pd.to_numeric(df[value_column], errors="coerce")
+    usable = values.dropna()
+    coverage = float((usable.shape[0] / len(df)) * 100) if len(df) else 0.0
+
+    return {
+        "sector": sector or "All sectors",
+        "deal_count": int(len(df)),
+        "value_non_null_count": int(values.notna().sum()),
+        "value_missing_count": int(values.isna().sum()),
+        "coverage_pct": coverage,
+        "average_deal_value": float(usable.mean()) if not usable.empty else None,
+        "median_deal_value": float(usable.median()) if not usable.empty else None,
+        "total_recorded_value": float(usable.sum()) if not usable.empty else 0.0,
+    }
+
+
+def closing_cycle_time(deals_df, sector=None):
+    """Measure close-time coverage and observed durations for closed deals."""
+
+    df = filter_deals(deals_df, sector=sector)
+    status_column = resolve_column(df, DEAL_COLUMN_ALIASES["status"])
+    created_column = resolve_column(df, DEAL_COLUMN_ALIASES["created_date"], required=False)
+    close_column = resolve_column(df, DEAL_COLUMN_ALIASES["close_date"], required=False)
+
+    status = df[status_column].astype(str).str.strip().str.lower()
+    closed_df = df.loc[status.isin(["won", "dead"])].copy()
+
+    created_dates = (
+        pd.to_datetime(closed_df[created_column], errors="coerce")
+        if created_column
+        else pd.Series(pd.NaT, index=closed_df.index)
+    )
+    close_dates = (
+        pd.to_datetime(closed_df[close_column], errors="coerce")
+        if close_column
+        else pd.Series(pd.NaT, index=closed_df.index)
+    )
+
+    days_to_close = (close_dates - created_dates).dt.days
+    usable = days_to_close.dropna()
+    negative_count = int((usable < 0).sum())
+    coverage = float((usable.shape[0] / len(closed_df)) * 100) if len(closed_df) else 0.0
+
+    return {
+        "sector": sector or "All sectors",
+        "closed_deal_count": int(len(closed_df)),
+        "usable_close_time_count": int(usable.shape[0]),
+        "missing_close_date_count": int(close_dates.isna().sum()),
+        "missing_created_date_count": int(created_dates.isna().sum()),
+        "coverage_pct": coverage,
+        "average_days_to_close": float(usable.mean()) if not usable.empty else None,
+        "median_days_to_close": float(usable.median()) if not usable.empty else None,
+        "min_days_to_close": float(usable.min()) if not usable.empty else None,
+        "max_days_to_close": float(usable.max()) if not usable.empty else None,
+        "negative_duration_count": negative_count,
+        "is_reliable": coverage >= 50.0 and negative_count == 0,
+    }
+
+
+def detect_data_entry_errors(deals_df, work_orders_df):
+    """Flag rows that look like header leakage or obvious malformed records."""
+
+    deal_sector_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["sector"], required=False)
+    suspect_rows = []
+
+    if deal_sector_column:
+        critical_columns = [
+            "Client Code",
+            resolve_column(deals_df, DEAL_COLUMN_ALIASES["status"], required=False),
+            "Closure Probability" if "Closure Probability" in deals_df.columns else None,
+            resolve_column(deals_df, DEAL_COLUMN_ALIASES["stage"], required=False),
+            "Product deal" if "Product deal" in deals_df.columns else None,
+        ]
+        critical_columns = [column for column in critical_columns if column]
+
+        header_like_mask = pd.Series(False, index=deals_df.index)
+        for column in deals_df.columns:
+            header_like_mask = header_like_mask | (
+                deals_df[column]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq(column.strip().lower())
+            )
+
+        missing_core = deals_df[critical_columns].isna().sum(axis=1) if critical_columns else 0
+        suspect_mask = header_like_mask | (missing_core >= max(3, len(critical_columns) - 1))
+
+        suspect_df = deals_df.loc[suspect_mask].copy()
+        for _, row in suspect_df.iterrows():
+            reason_parts = []
+            if (
+                pd.notna(row.get(deal_sector_column))
+                and str(row.get(deal_sector_column)).strip().lower() == deal_sector_column.strip().lower()
+            ):
+                reason_parts.append("sector cell contains header text")
+            if critical_columns:
+                blanks = [column for column in critical_columns if pd.isna(row.get(column))]
+                if blanks:
+                    reason_parts.append("key deal fields are blank")
+
+            suspect_rows.append(
+                {
+                    "board": "Deals",
+                    "item_name": row.get("item_name"),
+                    "client_code": row.get("Client Code"),
+                    "sector": row.get(deal_sector_column),
+                    "reason": "; ".join(reason_parts) or "looks malformed",
+                }
+            )
+
+    return {
+        "suspect_records": suspect_rows,
+        "suspect_record_count": len(suspect_rows),
+    }
+
+
+def cross_board_execution_gaps(deals_df, work_orders_df):
+    """Compare open deals and completed work orders by normalized client code."""
+
+    deal_code_column = resolve_column(deals_df, ["Client Code"])
+    work_order_code_column = resolve_column(work_orders_df, ["Customer Name Code"])
+    deal_status_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["status"])
+    execution_status_column = resolve_column(work_orders_df, ["Execution Status"])
+
+    deals = deals_df.copy()
+    work_orders = work_orders_df.copy()
+    deals["normalized_client_code"] = deals[deal_code_column].apply(normalize_client_code)
+    work_orders["normalized_client_code"] = work_orders[work_order_code_column].apply(normalize_client_code)
+
+    open_deals = deals.loc[
+        deals[deal_status_column].astype(str).str.strip().str.lower().eq("open")
+    ].copy()
+
+    completed_statuses = {"completed", "executed until current month"}
+    completed_work_orders = work_orders.loc[
+        work_orders[execution_status_column]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin(completed_statuses)
+    ].copy()
+
+    completed_codes = set(completed_work_orders["normalized_client_code"].dropna())
+    open_codes = set(open_deals["normalized_client_code"].dropna())
+
+    open_without_completed = open_deals.loc[
+        ~open_deals["normalized_client_code"].isin(completed_codes)
+    ].copy()
+    completed_without_open = completed_work_orders.loc[
+        ~completed_work_orders["normalized_client_code"].isin(open_codes)
+    ].copy()
+
+    return {
+        "open_deal_row_count": int(len(open_deals)),
+        "completed_work_order_row_count": int(len(completed_work_orders)),
+        "open_clients_without_completed_work_order": sorted(
+            open_without_completed["normalized_client_code"].dropna().unique().tolist()
+        ),
+        "completed_work_order_clients_without_open_deal": sorted(
+            completed_without_open["normalized_client_code"].dropna().unique().tolist()
+        ),
+        "open_rows_without_completed_work_order": int(len(open_without_completed)),
+        "completed_rows_without_open_deal": int(len(completed_without_open)),
+        "open_gap_sample": open_without_completed[
+            ["item_name", deal_code_column, resolve_column(deals_df, DEAL_COLUMN_ALIASES["sector"], required=False), "Owner code"]
+        ]
+        .head(10)
+        .rename(
+            columns={
+                deal_code_column: "client_code",
+                resolve_column(deals_df, DEAL_COLUMN_ALIASES["sector"], required=False): "sector",
+                "Owner code": "owner_code",
+            }
+        )
+        .to_dict(orient="records"),
+        "reverse_gap_sample": completed_without_open[
+            ["item_name", work_order_code_column, resolve_column(work_orders_df, WORK_ORDER_COLUMN_ALIASES["sector"], required=False), execution_status_column]
+        ]
+        .head(10)
+        .rename(
+            columns={
+                work_order_code_column: "customer_name_code",
+                resolve_column(work_orders_df, WORK_ORDER_COLUMN_ALIASES["sector"], required=False): "sector",
+                execution_status_column: "execution_status",
+            }
+        )
+        .to_dict(orient="records"),
+        "completed_statuses_used": sorted(completed_statuses),
+    }
+
+
+def win_rate_by_sector(deals_df, work_orders_df=None):
+    """Calculate closed-deal win rate by canonical sector and flag unmapped labels."""
+
+    sector_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["sector"])
+    status_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["status"])
+
+    deals = deals_df.copy()
+    deals["canonical_sector"] = deals[sector_column].apply(normalize_sector_name)
+    status = deals[status_column].astype(str).str.strip().str.lower()
+
+    breakdown = []
+    for sector in CANONICAL_SECTORS:
+        sector_df = deals.loc[deals["canonical_sector"] == sector]
+        closed_df = sector_df.loc[status.loc[sector_df.index].isin(["won", "dead"])]
+        won_count = int(
+            closed_df[status_column].astype(str).str.strip().str.lower().eq("won").sum()
+        )
+        dead_count = int(
+            closed_df[status_column].astype(str).str.strip().str.lower().eq("dead").sum()
+        )
+        closed_count = won_count + dead_count
+        win_rate = (won_count / closed_count * 100.0) if closed_count else None
+
+        breakdown.append(
+            {
+                "sector": sector,
+                "deal_count": int(len(sector_df)),
+                "closed_deal_count": int(closed_count),
+                "won_deal_count": won_count,
+                "dead_deal_count": dead_count,
+                "win_rate_pct": float(win_rate) if win_rate is not None else None,
+                "low_confidence": closed_count < 10,
+            }
+        )
+
+    unmapped = deals.loc[deals["canonical_sector"].isna(), sector_column].fillna("<blank>")
+    result = {
+        "breakdown": breakdown,
+        "excluded_unmapped_deal_rows": int(deals["canonical_sector"].isna().sum()),
+        "unmapped_sector_values": unmapped.value_counts(dropna=False).to_dict(),
+        "deal_distinct_sector_labels": int(deals[sector_column].fillna("<blank>").nunique(dropna=False)),
+    }
+
+    if work_orders_df is not None:
+        work_sector_column = resolve_column(work_orders_df, WORK_ORDER_COLUMN_ALIASES["sector"], required=False)
+        if work_sector_column:
+            result["work_order_distinct_sector_labels"] = int(
+                work_orders_df[work_sector_column].fillna("<blank>").nunique(dropna=False)
+            )
+
+    return result
+
+
+def active_pipeline_by_owner(deals_df):
+    """Rank active pipeline concentration by owner."""
+
+    status_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["status"])
+    owner_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["owner"])
+    value_column = resolve_column(deals_df, DEAL_COLUMN_ALIASES["value"])
+
+    df = deals_df.copy()
+    status = df[status_column].astype(str).str.strip().str.lower()
+    active_df = df.loc[status.isin(["open", "on hold"])].copy()
+    active_df["deal_value"] = pd.to_numeric(active_df[value_column], errors="coerce")
+
+    grouped = (
+        active_df.groupby(owner_column, dropna=False)
+        .agg(
+            active_deal_count=("item_id", "count"),
+            active_pipeline_value=("deal_value", "sum"),
+            value_non_null_count=("deal_value", lambda series: int(series.notna().sum())),
+        )
+        .reset_index()
+        .sort_values("active_pipeline_value", ascending=False)
+    )
+
+    total_active_deals = int(len(active_df))
+    total_active_value = float(active_df["deal_value"].fillna(0).sum())
+    owners = []
+    for _, row in grouped.iterrows():
+        deal_share = (row["active_deal_count"] / total_active_deals * 100.0) if total_active_deals else 0.0
+        value_share = (row["active_pipeline_value"] / total_active_value * 100.0) if total_active_value else 0.0
+        owners.append(
+            {
+                "owner": row[owner_column] or "<blank>",
+                "active_deal_count": int(row["active_deal_count"]),
+                "active_pipeline_value": float(row["active_pipeline_value"]),
+                "value_non_null_count": int(row["value_non_null_count"]),
+                "deal_share_pct": float(deal_share),
+                "value_share_pct": float(value_share),
+            }
+        )
+
+    return {
+        "owners": owners,
+        "total_active_deals": total_active_deals,
+        "total_active_pipeline_value": total_active_value,
+    }
+
+
+def billing_status_missing_fraction(work_orders_df):
+    """Measure how many work orders have no billing status recorded."""
+
+    status_column = resolve_column(work_orders_df, WORK_ORDER_COLUMN_ALIASES["billing_status"])
+    status = work_orders_df[status_column]
+    missing_mask = status.isna() | status.astype(str).str.strip().eq("")
+    missing_count = int(missing_mask.sum())
+    total_count = int(len(work_orders_df))
+    fraction = (missing_count / total_count * 100.0) if total_count else 0.0
+
+    return {
+        "status_column": status_column,
+        "missing_count": missing_count,
+        "total_count": total_count,
+        "missing_fraction_pct": float(fraction),
+    }
+
+
+def receivable_anomalies(work_orders_df):
+    """Flag unusual receivable values, with negatives highlighted first."""
+
+    receivable_column = resolve_column(work_orders_df, WORK_ORDER_COLUMN_ALIASES["amount_receivable"])
+    code_column = resolve_column(work_orders_df, ["Customer Name Code"], required=False)
+    values = pd.to_numeric(work_orders_df[receivable_column], errors="coerce")
+    negative_df = work_orders_df.loc[values < 0].copy()
+    negative_df["receivable_value"] = values.loc[negative_df.index]
+
+    positive_values = values.loc[values >= 0].dropna()
+    upper_outlier_threshold = None
+    positive_outliers = pd.DataFrame(columns=work_orders_df.columns)
+
+    if not positive_values.empty:
+        q1 = positive_values.quantile(0.25)
+        q3 = positive_values.quantile(0.75)
+        iqr = q3 - q1
+        upper_outlier_threshold = float(q3 + (1.5 * iqr))
+        positive_outliers = work_orders_df.loc[values > upper_outlier_threshold].copy()
+        positive_outliers["receivable_value"] = values.loc[positive_outliers.index]
+
+    return {
+        "negative_count": int(len(negative_df)),
+        "material_negative_count": int((negative_df["receivable_value"] < -1).sum()) if not negative_df.empty else 0,
+        "largest_negative_value": float(negative_df["receivable_value"].min()) if not negative_df.empty else None,
+        "negative_records": negative_df[
+            ["item_name", code_column, receivable_column, "receivable_value"]
+        ]
+        .head(10)
+        .rename(
+            columns={
+                code_column: "customer_name_code",
+                receivable_column: "raw_receivable_value",
+            }
+        )
+        .to_dict(orient="records"),
+        "positive_outlier_threshold": upper_outlier_threshold,
+        "positive_outlier_count": int(len(positive_outliers)),
+        "positive_outliers": positive_outliers[
+            ["item_name", code_column, receivable_column, "receivable_value"]
+        ]
+        .head(10)
+        .rename(
+            columns={
+                code_column: "customer_name_code",
+                receivable_column: "raw_receivable_value",
+            }
+        )
+        .to_dict(orient="records"),
     }

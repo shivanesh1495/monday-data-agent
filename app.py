@@ -859,12 +859,21 @@ def load_data():
     return work_orders, deals, work_quality, deal_quality
 
 
-def build_agent(deals_df, work_orders_df, work_quality, deal_quality):
+def build_agent(
+    deals_df,
+    work_orders_df,
+    work_quality,
+    deal_quality,
+    conversation_state=None,
+    data_context=None,
+):
     return create_agent(
         deals_df=deals_df,
         work_orders_df=work_orders_df,
         work_order_quality=work_quality,
         deal_quality=deal_quality,
+        conversation_state=conversation_state,
+        data_context=data_context,
     )
 
 
@@ -1274,11 +1283,19 @@ if "show_summary_panel" not in st.session_state:
 if "analysis_agent" not in st.session_state:
     st.session_state.analysis_agent = None
 
+if "analysis_context" not in st.session_state:
+    st.session_state.analysis_context = {}
+
+if "analysis_conversation_state" not in st.session_state:
+    st.session_state.analysis_conversation_state = {}
+
 
 def reset_chat_state():
     st.session_state.messages = []
     st.session_state.show_summary_panel = False
     st.session_state.analysis_agent = None
+    st.session_state.analysis_context = {}
+    st.session_state.analysis_conversation_state = {}
 
 
 live_data = True
@@ -1305,13 +1322,20 @@ except Exception:
     deal_quality = {}
 else:
     try:
-        if st.session_state.analysis_agent is None:
-            st.session_state.analysis_agent = build_agent(
-                deals_df=deals,
-                work_orders_df=work_orders,
-                work_quality=work_quality,
-                deal_quality=deal_quality,
-            )
+        st.session_state.analysis_context = {
+            "deals_df": deals,
+            "work_orders_df": work_orders,
+            "work_order_quality": work_quality,
+            "deal_quality": deal_quality,
+        }
+        st.session_state.analysis_agent = build_agent(
+            deals_df=deals,
+            work_orders_df=work_orders,
+            work_quality=work_quality,
+            deal_quality=deal_quality,
+            conversation_state=st.session_state.analysis_conversation_state,
+            data_context=st.session_state.analysis_context,
+        )
         ask = st.session_state.analysis_agent
     except Exception:
         agent_error = (

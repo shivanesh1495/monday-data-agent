@@ -5,9 +5,17 @@ import re
 from groq import Groq
 
 from tools import (
+    active_pipeline_by_owner,
+    average_deal_size,
+    billing_status_missing_fraction,
+    closing_cycle_time,
+    cross_board_execution_gaps,
     cross_reference_deal_to_execution,
+    detect_data_entry_errors,
     filter_deals,
     pipeline_summary,
+    receivable_anomalies,
+    win_rate_by_sector,
     work_order_financials,
 )
 
@@ -499,6 +507,250 @@ def format_overview_result(sector, pipeline_summary, work_order_summary):
     return "\n".join(lines)
 
 
+def format_average_deal_size_result(result):
+    if not result["deal_count"]:
+        return "No deals matched that request."
+
+    average = result["average_deal_value"]
+    if average is None:
+        return (
+            f"{result['sector']} average deal size\n"
+            "- No recorded deal values were available for the matching deals.\n"
+            "Data quality: I cannot calculate a grounded average without populated deal values."
+        )
+
+    return (
+        f"{result['sector']} average deal size\n"
+        f"- Average deal value: {average:,.2f}\n"
+        f"- Median deal value: {result['median_deal_value']:,.2f}\n"
+        f"- Sample used: {result['value_non_null_count']} of {result['deal_count']} deals "
+        f"({result['coverage_pct']:.1f}% coverage)\n"
+        "Data quality: missing deal values were not imputed, so treat this as a directional average."
+    )
+
+
+def format_closing_cycle_time_result(result):
+    if not result["closed_deal_count"]:
+        return "No closed deals matched that request."
+
+    if not result["usable_close_time_count"]:
+        return (
+            "Deal close time is not reliably tracked in the current board.\n"
+            f"- Closed deals: {result['closed_deal_count']}\n"
+            "- Deals with both Created Date and Close Date (A): 0\n"
+            "Data quality: there is not enough recorded close-date history to calculate a grounded cycle time."
+        )
+
+    reliability_line = (
+        "Data quality: this field is not reliable enough for a business-wide typical close-time answer."
+        if not result["is_reliable"]
+        else "Data quality: this estimate is based only on rows with both Created Date and Close Date (A)."
+    )
+
+    anomaly_line = ""
+    if result["negative_duration_count"]:
+        anomaly_line = (
+            f"\n- Negative durations found: {result['negative_duration_count']}"
+        )
+
+    return (
+        "Deal close time coverage\n"
+        f"- Closed deals: {result['closed_deal_count']}\n"
+        f"- Deals with both Created Date and Close Date (A): {result['usable_close_time_count']} "
+        f"({result['coverage_pct']:.1f}% coverage)\n"
+        f"- Observed median days to close: {result['median_days_to_close']:.1f}\n"
+        f"- Observed average days to close: {result['average_days_to_close']:.1f}"
+        f"{anomaly_line}\n"
+        f"{reliability_line}"
+    )
+
+
+def format_data_entry_errors_result(result):
+    if not result["suspect_record_count"]:
+        return "I did not find any obvious header-leak or malformed records."
+
+    lines = [
+        f"I found {result['suspect_record_count']} records that look like data-entry errors:",
+    ]
+
+    for row in result["suspect_records"][:10]:
+        lines.append(
+            f"- {row['item_name']}: {row['reason']}."
+        )
+
+    lines.append("These look safer to exclude from analysis than to treat as real business records.")
+    return "\n".join(lines)
+
+
+def format_cross_board_execution_gaps_result(result):
+    open_clients = result["open_clients_without_completed_work_order"]
+    reverse_clients = result["completed_work_order_clients_without_open_deal"]
+
+    lines = [
+        "Cross-board deal/work-order join",
+        (
+            f"- Open deals without a completed work order yet: {len(open_clients)} clients "
+            f"({result['open_rows_without_completed_work_order']} open-deal rows)"
+        ),
+        (
+            f"- Completed work orders without an open deal: {len(reverse_clients)} clients "
+            f"({result['completed_rows_without_open_deal']} completed work-order rows)"
+        ),
+    ]
+
+    if open_clients:
+        lines.append("- Open-deal gap sample: " + ", ".join(open_clients[:10]))
+    if reverse_clients:
+        lines.append("- Reverse-gap sample: " + ", ".join(reverse_clients[:10]))
+
+    statuses = ", ".join(result["completed_statuses_used"])
+    lines.append(
+        f"Matching note: I normalized deal client codes like COMPANY123 against work-order codes like "
+        f"WOCOMPANY_123, and treated these execution statuses as completed: {statuses}."
+    )
+    return "\n".join(lines)
+
+
+def format_win_rate_by_sector_result(result):
+    lines = ["Win rate by sector (closed deals only)"]
+
+    for row in result["breakdown"]:
+        if row["closed_deal_count"] == 0:
+            continue
+        suffix = " [low confidence: small sample]" if row["low_confidence"] else ""
+        lines.append(
+            f"- {row['sector']}: {row['win_rate_pct']:.1f}% "
+            f"({row['won_deal_count']} won / {row['dead_deal_count']} dead; {row['closed_deal_count']} closed){suffix}"
+        )
+
+    lines.append("")
+    lines.append(
+        f"Confidence flags: I excluded {result['excluded_unmapped_deal_rows']} deal rows with non-canonical sector labels from the sector table."
+    )
+
+    if result.get("unmapped_sector_values"):
+        labels = ", ".join(
+            f"{label} ({count})" for label, count in list(result["unmapped_sector_values"].items())[:10]
+        )
+        lines.append(f"- Unmapped deal-sector labels: {labels}")
+
+    if result.get("work_order_distinct_sector_labels") is not None:
+        if result["deal_distinct_sector_labels"] != result["work_order_distinct_sector_labels"]:
+            lines.append(
+                f"- Sector taxonomy mismatch: deals board has {result['deal_distinct_sector_labels']} distinct labels, "
+                f"while work orders have {result['work_order_distinct_sector_labels']}."
+            )
+        else:
+            lines.append(
+                f"- Sector taxonomy note: both boards show {result['deal_distinct_sector_labels']} distinct labels here, "
+                "but some deal rows still fall outside the canonical sector list."
+            )
+
+    lines.append("- Small-sample sectors should be treated as directional.")
+    return "\n".join(lines)
+
+
+def format_active_pipeline_by_owner_result(result):
+    owners = result["owners"]
+    if not owners:
+        return "There are no active open or on-hold deals right now."
+
+    top_owner = owners[0]
+    lines = [
+        f"Active pipeline is concentrated with {top_owner['owner']}.",
+        (
+            f"- {top_owner['owner']}: {top_owner['active_deal_count']} active deals, "
+            f"{top_owner['active_pipeline_value']:,.2f} in active value "
+            f"({top_owner['deal_share_pct']:.1f}% of active deals, {top_owner['value_share_pct']:.1f}% of active value)"
+        ),
+    ]
+
+    for row in owners[1:4]:
+        lines.append(
+            f"- {row['owner']}: {row['active_deal_count']} deals, {row['active_pipeline_value']:,.2f}"
+        )
+
+    lines.append("Data quality: active pipeline value uses recorded deal values only; missing values were not imputed.")
+    return "\n".join(lines)
+
+
+def format_billing_status_missing_fraction_result(result):
+    return (
+        f"Billing status coverage\n"
+        f"- Missing billing status: {result['missing_count']} of {result['total_count']} work orders "
+        f"({result['missing_fraction_pct']:.1f}%)\n"
+        "Data quality: billing-status-based analysis is weak until this field is filled more consistently."
+    )
+
+
+def format_receivable_anomalies_result(result):
+    if not result["negative_count"] and not result["positive_outlier_count"]:
+        return "I did not find any obvious receivable anomalies."
+
+    lines = ["Receivable anomalies worth a second look"]
+
+    if result["negative_count"]:
+        lines.append(
+            f"- Negative receivables: {result['negative_count']} records"
+        )
+        if result["largest_negative_value"] is not None:
+            lines.append(
+                f"- Largest negative receivable: {result['largest_negative_value']:,.2f}"
+            )
+        sample = result["negative_records"][:5]
+        if sample:
+            lines.append(
+                "- Negative sample: "
+                + ", ".join(
+                    f"{row['customer_name_code']} ({row['receivable_value']:,.2f})"
+                    for row in sample
+                )
+            )
+
+    if result["positive_outlier_count"]:
+        lines.append(
+            f"- High receivable outliers above {result['positive_outlier_threshold']:,.2f}: {result['positive_outlier_count']} records"
+        )
+
+    lines.append("I flagged these separately instead of silently blending them into average receivable analysis.")
+    return "\n".join(lines)
+
+
+def detect_grounded_question(question):
+    q = question.lower()
+
+    if "win rate" in q and (
+        "by sector" in q
+        or "across sectors" in q
+        or "break down" in q
+        or "breakdown" in q
+    ):
+        return {"kind": "win_rate_by_sector"}
+
+    if re.search(r"\baverage\b.*\bdeal size\b|\bavg\b.*\bdeal size\b|\baverage\b.*\bdeal value\b", q):
+        return {"kind": "average_deal_size", "sector": detect_sector(question)}
+
+    if re.search(r"\bhow long\b.*\bclose a deal\b|\btime to close\b|\bdays to close\b|\bsales cycle\b", q):
+        return {"kind": "closing_cycle_time", "sector": detect_sector(question)}
+
+    if re.search(r"\bdata entry errors?\b|\blook like data entry\b|\bsuspicious records?\b|\bmalformed records?\b", q):
+        return {"kind": "data_entry_errors"}
+
+    if "open deal" in q and "work order" in q:
+        return {"kind": "cross_board_execution_gaps"}
+
+    if "billing status" in q and re.search(r"\bfraction\b|\bpercent\b|\bpercentage\b|\bhow many\b|\bmissing\b|\bno\b", q):
+        return {"kind": "billing_status_missing_fraction"}
+
+    if "receivable" in q and re.search(r"\bunusual\b|\banomal|\bnegative\b|\bsecond look\b", q):
+        return {"kind": "receivable_anomalies"}
+
+    if "active pipeline" in q and re.search(r"\bbd\/kam\b|\bowner\b|\bcarrying\b", q):
+        return {"kind": "active_pipeline_by_owner"}
+
+    return None
+
+
 def compact_quality_summary(summary):
     """
     Reduce quality information size for Groq context.
@@ -526,22 +778,42 @@ def create_agent(
     work_orders_df,
     work_order_quality=None,
     deal_quality=None,
+    conversation_state=None,
+    data_context=None,
 ):
     api_key = os.getenv("GROQ_API_KEY")
-
-    if not api_key:
-        raise ValueError("GROQ_API_KEY is missing")
-
-    client = Groq(api_key=api_key)
+    client = Groq(api_key=api_key) if api_key else None
 
     quality_context = {
         "work_orders": compact_quality_summary(work_order_quality),
         "deals": compact_quality_summary(deal_quality),
     }
 
+    def current_deals_df():
+        if data_context and data_context.get("deals_df") is not None:
+            return data_context["deals_df"]
+        return deals_df
+
+    def current_work_orders_df():
+        if data_context and data_context.get("work_orders_df") is not None:
+            return data_context["work_orders_df"]
+        return work_orders_df
+
+    def current_quality_context():
+        if not data_context:
+            return quality_context
+        return {
+            "work_orders": compact_quality_summary(
+                data_context.get("work_order_quality", work_order_quality)
+            ),
+            "deals": compact_quality_summary(
+                data_context.get("deal_quality", deal_quality)
+            ),
+        }
+
     def tool_filter_deals(sector=None, status=None, stage=None, owner=None):
         result = filter_deals(
-            deals_df,
+            current_deals_df(),
             sector=sector,
             status=status,
             stage=stage,
@@ -552,37 +824,37 @@ def create_agent(
             "row_count": len(result),
             "columns": list(result.columns),
             "sample": result.head(10).to_dict(orient="records"),
-            "quality": quality_context["deals"],
+            "quality": current_quality_context()["deals"],
         }
 
     def tool_pipeline_summary(sector=None, time_window=None):
         result = pipeline_summary(
-            deals_df,
+            current_deals_df(),
             sector=sector,
             time_window=time_window or conversation_state.get("time_window"),
         )
-        return {"result": result, "quality": quality_context["deals"]}
+        return {"result": result, "quality": current_quality_context()["deals"]}
 
     def tool_work_order_financials(sector=None, time_window=None):
         result = work_order_financials(
-            work_orders_df,
+            current_work_orders_df(),
             sector=sector,
             time_window=time_window or conversation_state.get("time_window"),
         )
-        return {"result": result, "quality": quality_context["work_orders"]}
+        return {"result": result, "quality": current_quality_context()["work_orders"]}
 
     def tool_cross_reference(sector=None, time_window=None):
         result = cross_reference_deal_to_execution(
-            deals_df,
-            work_orders_df,
+            current_deals_df(),
+            current_work_orders_df(),
             sector=sector,
             time_window=time_window,
         )
         return {
             "result": result,
             "quality": {
-                "deals": quality_context["deals"],
-                "work_orders": quality_context["work_orders"],
+                "deals": current_quality_context()["deals"],
+                "work_orders": current_quality_context()["work_orders"],
             },
         }
 
@@ -696,7 +968,14 @@ def create_agent(
             "last_completed_task": None,
         }
 
-    conversation_state = empty_conversation_state()
+    if conversation_state is None:
+        conversation_state = empty_conversation_state()
+    else:
+        defaults = empty_conversation_state()
+        for key, value in defaults.items():
+            if key not in conversation_state:
+                conversation_state[key] = value.copy() if isinstance(value, list) else value
+        conversation_state["sectors"] = list(conversation_state.get("sectors") or [])
 
     def reset_active_task():
         completed = conversation_state.get("last_completed_task")
@@ -818,11 +1097,70 @@ def create_agent(
         finish_active_task()
         return answer
 
+    def run_grounded_question(question_type):
+        kind = question_type["kind"]
+
+        if kind == "average_deal_size":
+            result = average_deal_size(
+                current_deals_df(),
+                sector=question_type.get("sector"),
+            )
+            return format_average_deal_size_result(result)
+
+        if kind == "closing_cycle_time":
+            result = closing_cycle_time(
+                current_deals_df(),
+                sector=question_type.get("sector"),
+            )
+            return format_closing_cycle_time_result(result)
+
+        if kind == "data_entry_errors":
+            result = detect_data_entry_errors(
+                current_deals_df(),
+                current_work_orders_df(),
+            )
+            return format_data_entry_errors_result(result)
+
+        if kind == "cross_board_execution_gaps":
+            result = cross_board_execution_gaps(
+                current_deals_df(),
+                current_work_orders_df(),
+            )
+            return format_cross_board_execution_gaps_result(result)
+
+        if kind == "win_rate_by_sector":
+            result = win_rate_by_sector(
+                current_deals_df(),
+                current_work_orders_df(),
+            )
+            return format_win_rate_by_sector_result(result)
+
+        if kind == "active_pipeline_by_owner":
+            result = active_pipeline_by_owner(current_deals_df())
+            return format_active_pipeline_by_owner_result(result)
+
+        if kind == "billing_status_missing_fraction":
+            result = billing_status_missing_fraction(current_work_orders_df())
+            return format_billing_status_missing_fraction_result(result)
+
+        if kind == "receivable_anomalies":
+            result = receivable_anomalies(current_work_orders_df())
+            return format_receivable_anomalies_result(result)
+
+        return None
+
     def ask(question):
         question_lower = question.lower()
         current_sectors = detect_sectors(question)
         time_window = detect_time_window(question)
         metric = detect_metric(question)
+        grounded_question = detect_grounded_question(question)
+
+        if grounded_question:
+            answer = run_grounded_question(grounded_question)
+            if answer:
+                finish_active_task()
+                return answer
 
         direct_question = detect_direct_business_question(question)
         if is_sector_metric_comparison_question(question):
@@ -937,6 +1275,12 @@ def create_agent(
 
             conversation_state["awaiting"] = None
             return run_cross_reference_task()
+
+        if client is None:
+            return (
+                "I can still answer the structured monday.com questions that are wired to deterministic tools, "
+                "but the Groq fallback is not configured for broader open-ended analysis right now."
+            )
 
         tool_choice = "auto"
 
