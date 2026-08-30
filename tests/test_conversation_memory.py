@@ -178,6 +178,54 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIn("Railways: 500.00", result)
         self.assertIn("Powerline: 450.00", result)
 
+    @patch("agent.work_order_financials")
+    @patch("agent.pipeline_summary")
+    def test_overview_question_routes_to_combined_sector_summary(
+        self,
+        mock_pipeline,
+        mock_work_orders,
+    ):
+        mock_pipeline.return_value = {
+            "deal_count": 2,
+            "total_deal_value": 2000,
+            "active_pipeline_value": 1200,
+            "won_value": 500,
+            "dead_value": 300,
+            "on_hold_value": 100,
+            "open_deals": 1,
+            "time_filter": {
+                "requested_time_window": "this_quarter",
+                "time_window_applied": True,
+                "date_basis": ["Close Date (A)"],
+                "excluded_missing_date_rows": 0,
+                "window_start": "2026-07-01",
+                "window_end": "2026-09-30",
+            },
+        }
+        mock_work_orders.return_value = {
+            "work_order_count": 2,
+            "total_order_value": 1800,
+            "billed_value": 900,
+            "collected_amount": 700,
+            "amount_to_be_billed": 400,
+            "amount_receivable": 250,
+            "time_filter": {
+                "requested_time_window": "this_quarter",
+                "time_window_applied": True,
+                "date_basis": ["Date of PO/LOI"],
+                "excluded_missing_date_rows": 0,
+                "window_start": "2026-07-01",
+                "window_end": "2026-09-30",
+            },
+        }
+
+        result = self.ask("How are we doing in Railways this quarter?")
+
+        self.assertIn("Railways business overview", result)
+        self.assertIn("2026-07-01 to 2026-09-30", result)
+        self.assertIn("Deal pipeline value: 2,000.00", result)
+        self.assertIn("Collected amount: 700.00", result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -274,16 +274,33 @@ def metric_value_from_summary(metric, summary):
     return float(data.get(metric, 0))
 
 
+def format_time_filter_note(time_filter):
+    if not time_filter or not time_filter.get("requested_time_window"):
+        return None
+
+    requested = time_filter["requested_time_window"].replace("_", " ")
+    if not time_filter.get("time_window_applied"):
+        return f"Requested time window: {requested}. The current tool could not apply a historical filter."
+
+    basis = ", ".join(time_filter.get("date_basis", [])) or "available date fields"
+    start = time_filter.get("window_start")
+    end = time_filter.get("window_end")
+    missing_rows = time_filter.get("excluded_missing_date_rows", 0)
+
+    note = f"Requested time window: {requested} ({start} to {end}) using {basis}."
+    if missing_rows:
+        note += f" {missing_rows} rows without a usable date were excluded from the historical filter."
+    return note
+
+
 def format_cross_reference_result(payloads, time_window=None):
     """Format deterministic cross-reference results without inventing values."""
 
     lines = ["Sector comparison"]
-    if time_window:
-        lines.append(
-            f"Requested time window: {time_window.replace('_', ' ')}. "
-            "Historical time filtering is not available in the current board tools, "
-            "so the figures below reflect the current normalized board state."
-        )
+    if payloads:
+        time_filter_note = format_time_filter_note(payloads[0]["result"].get("time_filter"))
+        if time_filter_note:
+            lines.append(time_filter_note)
 
     for payload in payloads:
         result = payload["result"]
@@ -315,12 +332,10 @@ def format_sector_metric_comparison(payloads, metric, domain, time_window=None):
     value_kind = definition["format"] if definition else "money"
     lines = [f"Sector comparison - {label}"]
 
-    if time_window:
-        lines.append(
-            f"Requested time window: {time_window.replace('_', ' ')}. "
-            "Historical time filtering is not available in the current board tools, "
-            "so the figures below reflect the current normalized board state."
-        )
+    if payloads:
+        time_filter_note = format_time_filter_note(payloads[0]["summary"]["result"].get("time_filter"))
+        if time_filter_note:
+            lines.append(time_filter_note)
 
     scored = []
     for payload in payloads:
@@ -397,15 +412,25 @@ def detect_direct_business_question(question):
     return None
 
 
+def is_overview_question(question):
+    q = question.lower()
+    overview_terms = [
+        "how are we doing",
+        "performance",
+        "overview",
+        "health",
+        "operational",
+        "operations",
+        "summary",
+        "leadership update",
+    ]
+    return any(term in q for term in overview_terms) and not is_cross_reference_question(question)
+
+
 def format_direct_business_result(kind, sector, summary, time_window=None, metric=None):
     """Render a concise deterministic result for a single-sector BI question."""
-    time_window_note = ""
-    if time_window:
-        time_window_note = (
-            f"Requested time window: {time_window.replace('_', ' ')}. "
-            "Historical time filtering is not available in the current board tools, "
-            "so the figures below reflect the current normalized board state.\n"
-        )
+    time_window_note = format_time_filter_note(summary["result"].get("time_filter"))
+    time_window_line = f"{time_window_note}\n" if time_window_note else ""
 
     if metric:
         definition = metric_definition(metric)
@@ -422,7 +447,7 @@ def format_direct_business_result(kind, sector, summary, time_window=None, metri
         data = summary["result"]
         return (
             f"{sector or 'All sectors'} deal pipeline\n"
-            f"{time_window_note}"
+            f"{time_window_line}"
             f"{focus_line}"
             f"- Deals: {data['deal_count']}\n"
             f"- Total deal value: {data['total_deal_value']:,.2f}\n"
@@ -436,7 +461,7 @@ def format_direct_business_result(kind, sector, summary, time_window=None, metri
     data = summary["result"]
     return (
         f"{sector or 'All sectors'} work-order execution\n"
-        f"{time_window_note}"
+        f"{time_window_line}"
         f"{focus_line}"
         f"- Work orders: {data['work_order_count']}\n"
         f"- Total order value: {data['total_order_value']:,.2f}\n"
@@ -446,6 +471,32 @@ def format_direct_business_result(kind, sector, summary, time_window=None, metri
         f"- Amount receivable: {data['amount_receivable']:,.2f}\n"
         "Data quality: missing values were not imputed; incomplete board fields may affect totals."
     )
+
+
+def format_overview_result(sector, pipeline_summary, work_order_summary):
+    pipeline = pipeline_summary["result"]
+    work_orders = work_order_summary["result"]
+    lines = [f"{sector or 'All sectors'} business overview"]
+
+    pipeline_note = format_time_filter_note(pipeline.get("time_filter"))
+    if pipeline_note:
+        lines.append(pipeline_note)
+
+    lines.extend(
+        [
+            f"- Deal pipeline value: {pipeline['total_deal_value']:,.2f}",
+            f"- Active pipeline value: {pipeline['active_pipeline_value']:,.2f}",
+            f"- Won value: {pipeline['won_value']:,.2f}",
+            f"- Work-order value: {work_orders['total_order_value']:,.2f}",
+            f"- Billed value: {work_orders['billed_value']:,.2f}",
+            f"- Collected amount: {work_orders['collected_amount']:,.2f}",
+            (
+                "Interpretation: this combines commercial momentum and execution progress in one sector-level view."
+            ),
+            "Data quality: missing values were not imputed; incomplete board fields may affect totals.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def compact_quality_summary(summary):
@@ -504,12 +555,20 @@ def create_agent(
             "quality": quality_context["deals"],
         }
 
-    def tool_pipeline_summary(sector=None):
-        result = pipeline_summary(deals_df, sector=sector)
+    def tool_pipeline_summary(sector=None, time_window=None):
+        result = pipeline_summary(
+            deals_df,
+            sector=sector,
+            time_window=time_window or conversation_state.get("time_window"),
+        )
         return {"result": result, "quality": quality_context["deals"]}
 
-    def tool_work_order_financials(sector=None):
-        result = work_order_financials(work_orders_df, sector=sector)
+    def tool_work_order_financials(sector=None, time_window=None):
+        result = work_order_financials(
+            work_orders_df,
+            sector=sector,
+            time_window=time_window or conversation_state.get("time_window"),
+        )
         return {"result": result, "quality": quality_context["work_orders"]}
 
     def tool_cross_reference(sector=None, time_window=None):
@@ -560,11 +619,17 @@ def create_agent(
                 "name": "pipeline_summary",
                 "description": (
                     "Calculate deal count, deal value, open, won, dead and on-hold deal counts. "
-                    "Can optionally be restricted to a sector."
+                    "Can optionally be restricted to a sector and a supported historical time window."
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"sector": {"type": "string", "description": "Optional sector."}},
+                    "properties": {
+                        "sector": {"type": "string", "description": "Optional sector."},
+                        "time_window": {
+                            "type": "string",
+                            "description": "Optional period label such as last_month or this_quarter.",
+                        },
+                    },
                     "required": [],
                 },
             },
@@ -575,11 +640,17 @@ def create_agent(
                 "name": "work_order_financials",
                 "description": (
                     "Calculate work-order count, order value, billed value, collected amount, "
-                    "amount to be billed and receivables."
+                    "amount to be billed and receivables. Can optionally be restricted to a sector and time window."
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"sector": {"type": "string", "description": "Optional sector."}},
+                    "properties": {
+                        "sector": {"type": "string", "description": "Optional sector."},
+                        "time_window": {
+                            "type": "string",
+                            "description": "Optional period label such as last_month or this_quarter.",
+                        },
+                    },
                     "required": [],
                 },
             },
@@ -670,6 +741,13 @@ def create_agent(
         conversation_state["metric"] = metric
         remember_active_context(sectors=sectors, time_window=time_window, metric=metric)
 
+    def start_overview_task(sectors=None, time_window=None):
+        reset_active_task()
+        conversation_state["task"] = "overview"
+        conversation_state["domain"] = "overview"
+        conversation_state["metric"] = "overview"
+        remember_active_context(sectors=sectors, time_window=time_window)
+
     def finish_active_task():
         conversation_state["last_completed_task"] = {
             "task": conversation_state["task"],
@@ -732,6 +810,14 @@ def create_agent(
         finish_active_task()
         return answer
 
+    def run_overview_task():
+        sector = conversation_state["sectors"][0] if conversation_state["sectors"] else None
+        pipeline = tool_pipeline_summary(sector=sector)
+        work_orders = tool_work_order_financials(sector=sector)
+        answer = format_overview_result(sector, pipeline, work_orders)
+        finish_active_task()
+        return answer
+
     def ask(question):
         question_lower = question.lower()
         current_sectors = detect_sectors(question)
@@ -744,6 +830,11 @@ def create_agent(
             start_sector_comparison_task(
                 domain=domain,
                 metric=metric,
+                sectors=current_sectors,
+                time_window=time_window,
+            )
+        elif is_overview_question(question):
+            start_overview_task(
                 sectors=current_sectors,
                 time_window=time_window,
             )
@@ -763,7 +854,7 @@ def create_agent(
                 sectors=current_sectors,
                 time_window=time_window,
             )
-        elif conversation_state["task"] in {"pipeline", "work_order", "cross_reference", "sector_comparison"}:
+        elif conversation_state["task"] in {"pipeline", "work_order", "cross_reference", "sector_comparison", "overview"}:
             remember_active_context(
                 sectors=current_sectors,
                 time_window=time_window,
@@ -787,6 +878,17 @@ def create_agent(
 
             conversation_state["awaiting"] = None
             return run_direct_task()
+
+        if conversation_state["task"] == "overview":
+            if not conversation_state["sectors"] and not is_all_sectors_question(question):
+                conversation_state["awaiting"] = "sector"
+                return (
+                    "Which sector should I summarize? Available sectors are: Mining, Renewables, "
+                    "Railways, Powerline, Construction, and Others."
+                )
+
+            conversation_state["awaiting"] = None
+            return run_overview_task()
 
         if conversation_state["task"] == "sector_comparison":
             if not conversation_state["metric"]:
