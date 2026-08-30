@@ -118,12 +118,12 @@ def detect_time_window(question):
 
     question_lower = question.lower().replace("-", " ")
     patterns = {
-        "last_month": r"\blast\s+month\b",
-        "this_month": r"\bthis\s+month\b",
-        "last_quarter": r"\blast\s+quarter\b",
-        "this_quarter": r"\bthis\s+quarter\b",
-        "this_year": r"\bthis\s+year\b",
-        "last_year": r"\blast\s+year\b",
+        "last_month": r"\blast\s+month\b|\bprevious\s+month\b",
+        "this_month": r"\bthis\s+month\b|\bcurrent\s+month\b",
+        "last_quarter": r"\blast\s+quarter\b|\bprevious\s+quarter\b",
+        "this_quarter": r"\bthis\s+quarter\b|\bcurrent\s+quarter\b",
+        "this_year": r"\bthis\s+year\b|\bcurrent\s+year\b",
+        "last_year": r"\blast\s+year\b|\bprevious\s+year\b",
     }
 
     for label, pattern in patterns.items():
@@ -187,6 +187,67 @@ def format_cross_reference_result(payloads, time_window=None):
         ]
     )
     return "\n".join(lines)
+
+
+def detect_direct_business_question(question):
+    """Return a deterministic BI instruction for common direct questions."""
+    q = question.lower()
+    if is_cross_reference_question(question):
+        return None
+
+    if re.search(r"\bcompare\b|\bcomparison\b|\bversus\b|\bvs\b|\bagainst\b", q):
+        return None
+
+    sector = detect_sector(question)
+
+    pipeline_keywords = [
+        "deal pipeline",
+        "pipeline",
+        "deal value",
+        "deal volume",
+        "deal summary",
+    ]
+    execution_keywords = [
+        "work order",
+        "work-order",
+        "work order execution",
+        "execution value",
+        "work order value",
+    ]
+
+    if any(keyword in q for keyword in execution_keywords):
+        return {"kind": "work_order", "sector": sector}
+
+    if any(keyword in q for keyword in pipeline_keywords):
+        return {"kind": "pipeline", "sector": sector}
+
+    return None
+
+
+def format_direct_business_result(kind, sector, summary):
+    """Render a concise deterministic result for a single-sector BI question."""
+    if kind == "pipeline":
+        data = summary["result"]
+        return (
+            f"{sector or 'All sectors'} deal pipeline\n"
+            f"- Deals: {data['deal_count']}\n"
+            f"- Total deal value: {data['total_deal_value']:,.2f}\n"
+            f"- Open deals: {data['open_deals']}\n"
+            f"- Won value: {data['won_value']:,.2f}\n"
+            f"- On-hold value: {data['on_hold_value']:,.2f}\n"
+            f"- Dead value: {data['dead_value']:,.2f}"
+        )
+
+    data = summary["result"]
+    return (
+        f"{sector or 'All sectors'} work-order execution\n"
+        f"- Work orders: {data['work_order_count']}\n"
+        f"- Total order value: {data['total_order_value']:,.2f}\n"
+        f"- Billed value: {data['billed_value']:,.2f}\n"
+        f"- Collected amount: {data['collected_amount']:,.2f}\n"
+        f"- Amount to be billed: {data['amount_to_be_billed']:,.2f}\n"
+        f"- Amount receivable: {data['amount_receivable']:,.2f}"
+    )
 
 
 def compact_quality_summary(summary):
@@ -364,10 +425,28 @@ def create_agent(
     }
 
     def ask(question):
+        question_lower = question.lower()
         current_sectors = detect_sectors(question)
         for sector in current_sectors:
             if sector not in conversation_state["sectors"]:
                 conversation_state["sectors"].append(sector)
+
+        direct_question = detect_direct_business_question(question)
+        if direct_question:
+            sector = direct_question["sector"]
+            if not sector:
+                return (
+                    "Which sector should I compare? Available sectors are: Mining, Renewables, "
+                    "Railways, Powerline, Construction, and Others."
+                )
+
+            if direct_question["kind"] == "pipeline":
+                summary = tool_pipeline_summary(sector=sector)
+                return format_direct_business_result("pipeline", sector, summary)
+
+            if direct_question["kind"] == "work_order":
+                summary = tool_work_order_financials(sector=sector)
+                return format_direct_business_result("work_order", sector, summary)
 
         if is_cross_reference_question(question):
             conversation_state["cross_reference_started"] = True
@@ -386,7 +465,7 @@ def create_agent(
             )
 
         if conversation_state["cross_reference_started"]:
-            if re.search(r"\ball\s+sectors?\b", question.lower()):
+            if re.search(r"\ball\s+sectors?\b", question_lower):
                 conversation_state["awaiting"] = "sector"
                 return (
                     "I can compare sectors individually. Which sectors would you like me "
@@ -394,18 +473,28 @@ def create_agent(
                     "Powerline, Construction, and Others."
                 )
 
-            if not conversation_state["sectors"]:
+            if not conversation_state["sectors"] and not current_sectors:
                 conversation_state["awaiting"] = "sector"
                 return (
                     "Which sector should I compare? Available sectors are: Mining, Renewables, "
                     "Railways, Powerline, Construction, and Others."
                 )
 
-            if conversation_state["awaiting"] == "sector" and not time_window:
+            direct_specific_comparison = (
+                is_cross_reference_question(question)
+                and bool(current_sectors)
+                and not re.search(r"\btime\s+frame\b|\btimeframe\b|\bperiod\b", question_lower)
+            )
+
+            if (
+                not conversation_state["time_window"]
+                and not direct_specific_comparison
+                and conversation_state["sectors"]
+            ):
                 conversation_state["awaiting"] = "time_window"
                 return "What time period should I use?"
 
-            if conversation_state["awaiting"] == "time_window" and not time_window:
+            if conversation_state["awaiting"] == "time_window" and not conversation_state["time_window"]:
                 return "What time period should I use?"
 
             conversation_state["awaiting"] = None
