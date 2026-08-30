@@ -1,185 +1,189 @@
 import os
 
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import pandas as pd
 
-from monday_client import MondayClient
-from normalize import normalize_deals, normalize_work_orders
+
+def filter_deals(
+    deals_df,
+    sector=None,
+    status=None,
+    stage=None,
+    owner=None
+):
+    """
+    Filter deals using optional criteria.
+    """
+
+    df = deals_df.copy()
+
+    if sector:
+        df = df[
+            df["Sector/service"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == sector.strip().lower()
+        ]
+
+    if status:
+        df = df[
+            df["Deal Status"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == status.strip().lower()
+        ]
+
+    if stage:
+        df = df[
+            df["Deal Stage"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == stage.strip().lower()
+        ]
+
+    if owner:
+        df = df[
+            df["Owner code"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == owner.strip().lower()
+        ]
+
+    return df
 
 
-def _numeric(value):
-    if pd.isna(value):
-        return 0.0
+def pipeline_summary(deals_df, sector=None):
+    """
+    Calculate pipeline metrics from the Deals DataFrame.
+    """
 
-    if isinstance(value, str):
-        value = value.strip().replace(",", "").replace("₹", "").replace("$", "")
-        if not value:
-            return 0.0
+    df = filter_deals(deals_df, sector=sector)
 
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+    if df.empty:
+        return {
+            "deal_count": 0,
+            "total_pipeline_value": 0,
+            "open_deals": 0,
+            "won_deals": 0,
+            "dead_deals": 0,
+            "on_hold_deals": 0,
+        }
 
+    value = pd.to_numeric(df["Masked Deal value"], errors="coerce")
 
-def _get_board_data():
-    client = MondayClient()
-
-    work_orders = client.board_to_dataframe(os.getenv("WORK_ORDER_BOARD_ID"))
-    deals = client.board_to_dataframe(os.getenv("DEAL_FUNNEL_BOARD_ID"))
-
-    work_orders = normalize_work_orders(work_orders)
-    deals = normalize_deals(deals)
-
-    return work_orders, deals
-
-
-def get_deal_summary(deals=None):
-    if deals is None:
-        _, deals = _get_board_data()
-
-    deals = deals.copy()
-    deals["Masked Deal value"] = pd.to_numeric(
-        deals["Masked Deal value"].apply(_numeric), errors="coerce"
-    )
-
-    status_summary = deals["Deal Status"].fillna("Unknown").astype(str).str.strip()
-    status_counts = status_summary.value_counts().to_dict()
-
-    sector_summary = deals.groupby("Sector/service", dropna=False)["Masked Deal value"].sum().to_dict()
-    stage_summary = deals["Deal Stage"].fillna("Unknown").astype(str).str.strip().value_counts().to_dict()
-
-    total_pipeline = float(deals["Masked Deal value"].sum())
-    open_value = float(
-        deals.loc[deals["Deal Status"].fillna("").str.lower().eq("open"), "Masked Deal value"].sum()
-    )
+    status = df["Deal Status"].astype(str).str.strip().str.lower()
 
     return {
-        "deal_count": int(len(deals)),
-        "total_pipeline_value": round(total_pipeline, 2),
-        "open_pipeline_value": round(open_value, 2),
-        "status_counts": status_counts,
-        "sector_summary": {k: round(v, 2) for k, v in sector_summary.items()},
-        "stage_summary": stage_summary,
+        "deal_count": len(df),
+        "total_pipeline_value": float(value.fillna(0).sum()),
+        "open_deals": int((status == "open").sum()),
+        "won_deals": int((status == "won").sum()),
+        "dead_deals": int((status == "dead").sum()),
+        "on_hold_deals": int((status == "on hold").sum()),
     }
 
 
-def get_pipeline_by_sector(deals=None):
-    if deals is None:
-        _, deals = _get_board_data()
+def work_order_financials(work_orders_df, sector=None):
+    """
+    Calculate financial metrics for work orders.
+    """
 
-    deals = deals.copy()
-    deals["Masked Deal value"] = pd.to_numeric(
-        deals["Masked Deal value"].apply(_numeric), errors="coerce"
-    )
+    df = work_orders_df.copy()
+
+    if sector:
+        df = df[
+            df["Sector"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == sector.strip().lower()
+        ]
+
+    if df.empty:
+        return {
+            "work_order_count": 0,
+            "total_order_value": 0,
+            "billed_value": 0,
+            "collected_amount": 0,
+            "amount_to_be_billed": 0,
+            "amount_receivable": 0,
+        }
+
+    def number(column):
+        return pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    amount_value_cols = {
+        "total_order_value": "Amount in Rupees (Excl of GST) (Masked)",
+        "billed_value": "Billed Value in Rupees (Excl of GST.) (Masked)",
+        "collected_amount": "Collected Amount in Rupees (Incl of GST.) (Masked)",
+        "amount_to_be_billed": "Amount to be billed in Rs. (Exl. of GST) (Masked)",
+        "amount_receivable": "Amount Receivable (Masked)",
+    }
+
+    fallback_cols = {
+        "collected_amount": [
+            "Collected Amount in Rupees (Incl. GST.) (Masked)",
+            "Collected Amount in Rupees (Incl of GST.) (Masked)",
+        ],
+        "billed_value": [
+            "Billed Value in Rupees (Excl of GST.) (Masked)",
+            "Billed Value in Rupees (Excl of GST) (Masked)",
+        ],
+        "amount_to_be_billed": [
+            "Amount to be billed in Rs. (Exl. of GST) (Masked)",
+            "Amount to be billed in Rs. (Exl. of GST.) (Masked)",
+        ],
+    }
+
+    resolved = {}
+    for field, default_col in amount_value_cols.items():
+        col_name = default_col
+        if default_col not in df.columns:
+            candidates = fallback_cols.get(field, [])
+            for candidate in candidates:
+                if candidate in df.columns:
+                    col_name = candidate
+                    break
+        resolved[field] = col_name
 
     return {
-        sector: round(float(total), 2)
-        for sector, total in deals.groupby("Sector/service", dropna=False)["Masked Deal value"].sum().items()
+        "work_order_count": len(df),
+        "total_order_value": float(number(resolved["total_order_value"]).sum()),
+        "billed_value": float(number(resolved["billed_value"]).sum()),
+        "collected_amount": float(number(resolved["collected_amount"]).sum()),
+        "amount_to_be_billed": float(number(resolved["amount_to_be_billed"]).sum()),
+        "amount_receivable": float(number(resolved["amount_receivable"]).sum()),
     }
 
 
-def get_revenue_by_sector(work_orders=None):
-    if work_orders is None:
-        work_orders, _ = _get_board_data()
+def cross_reference_deal_to_execution(
+    deals_df,
+    work_orders_df,
+    sector=None,
+):
+    """
+    Compare deal pipeline and work-order execution
+    for a sector.
+    """
 
-    work_orders = work_orders.copy()
-
-    amount_columns = [
-        column for column in work_orders.columns
-        if "Amount in Rupees" in column and "Masked" in column
-    ]
-
-    if not amount_columns:
-        return {}
-
-    total_col = amount_columns[0]
-    work_orders[total_col] = pd.to_numeric(work_orders[total_col].apply(_numeric), errors="coerce")
+    deal_data = pipeline_summary(deals_df, sector=sector)
+    work_data = work_order_financials(work_orders_df, sector=sector)
 
     return {
-        sector: round(float(total), 2)
-        for sector, total in work_orders.groupby("Sector", dropna=False)[total_col].sum().items()
+        "sector": sector or "All sectors",
+        "pipeline": deal_data,
+        "execution": work_data,
+        "comparison": {
+            "pipeline_deal_count": deal_data["deal_count"],
+            "work_order_count": work_data["work_order_count"],
+            "pipeline_value": deal_data["total_pipeline_value"],
+            "executed_order_value": work_data["total_order_value"],
+        },
     }
-
-
-def get_deal_stage_summary(deals=None):
-    if deals is None:
-        _, deals = _get_board_data()
-
-    deals = deals.copy()
-    return {
-        str(stage): int(count)
-        for stage, count in deals["Deal Stage"].fillna("Unknown").astype(str).str.strip().value_counts().items()
-    }
-
-
-def get_work_order_summary(work_orders=None):
-    if work_orders is None:
-        work_orders, _ = _get_board_data()
-
-    work_orders = work_orders.copy()
-
-    execution_counts = work_orders["Execution Status"].fillna("Unknown").astype(str).str.strip().value_counts().to_dict()
-
-    revenue_columns = [
-        column for column in work_orders.columns
-        if "Amount in Rupees" in column and "Masked" in column
-    ]
-    total_revenue = 0.0
-    if revenue_columns:
-        work_orders[revenue_columns[0]] = pd.to_numeric(
-            work_orders[revenue_columns[0]].apply(_numeric), errors="coerce"
-        )
-        total_revenue = float(work_orders[revenue_columns[0]].sum())
-
-    return {
-        "work_order_count": int(len(work_orders)),
-        "execution_status": execution_counts,
-        "total_revenue": round(total_revenue, 2),
-    }
-
-
-def get_execution_status(work_orders=None):
-    if work_orders is None:
-        work_orders, _ = _get_board_data()
-
-    work_orders = work_orders.copy()
-    return {
-        str(status): int(count)
-        for status, count in work_orders["Execution Status"].fillna("Unknown").astype(str).str.strip().value_counts().items()
-    }
-
-
-def get_billing_summary(work_orders=None):
-    if work_orders is None:
-        work_orders, _ = _get_board_data()
-
-    work_orders = work_orders.copy()
-    billing_status = work_orders["Billing Status"].fillna("Unknown").astype(str).str.strip().value_counts().to_dict()
-
-    revenue_columns = [
-        column for column in work_orders.columns
-        if "Amount in Rupees" in column and "Masked" in column
-    ]
-    billed_total = 0.0
-    if revenue_columns:
-        work_orders[revenue_columns[0]] = pd.to_numeric(
-            work_orders[revenue_columns[0]].apply(_numeric), errors="coerce"
-        )
-        billed_total = float(work_orders[revenue_columns[0]].sum())
-
-    return {
-        "billing_counts": billing_status,
-        "estimated_revenue_total": round(billed_total, 2),
-    }
-
-
-def get_tools():
-    return [
-        get_deal_summary,
-        get_pipeline_by_sector,
-        get_revenue_by_sector,
-        get_deal_stage_summary,
-        get_work_order_summary,
-        get_execution_status,
-        get_billing_summary,
-    ]
