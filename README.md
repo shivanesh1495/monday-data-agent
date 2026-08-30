@@ -55,8 +55,8 @@ The app is organized into five main modules:
 1. The app reads live board data from monday.com.
 2. The raw board items are converted into pandas DataFrames.
 3. Dates and text fields are normalized.
-4. Quality summaries are generated for missing/incomplete fields.
-5. The agent interprets the user’s question.
+4. Quality summaries are generated for missing and incomplete fields.
+5. The agent interprets the user's question.
 6. Deterministic BI tools compute the answer.
 7. The UI renders results along with caveats and context.
 
@@ -110,7 +110,7 @@ The code is resilient to a few alternate column titles, but keeping the imported
 
 ## Environment Variables
 
-Create a `.env` file in the project root with:
+Use the included [`.env.example`](D:/monday-data-agent/.env.example:1) as your template.
 
 ```env
 MONDAY_API_TOKEN=your_monday_api_token
@@ -133,6 +133,59 @@ streamlit run app.py
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q -vv
 ```
+
+## Hosting
+
+### Recommended: Streamlit Community Cloud
+
+This is the fastest path for the assignment because the app is already built with Streamlit and your Git remote already points to:
+
+- `https://github.com/shivanesh1495/monday-data-agent.git`
+
+Deployment steps:
+
+1. Commit and push your latest changes to the `main` branch.
+2. Open [share.streamlit.io](https://share.streamlit.io/).
+3. Click `Create app`.
+4. Select:
+   - Repository: `shivanesh1495/monday-data-agent`
+   - Branch: `main`
+   - Main file path: `app.py`
+5. Open `Advanced settings`.
+6. Set Python to `3.11`.
+7. Paste these secrets:
+
+```toml
+MONDAY_API_TOKEN="your_monday_api_token"
+WORK_ORDER_BOARD_ID="your_work_order_board_id"
+DEAL_FUNNEL_BOARD_ID="your_deal_funnel_board_id"
+GROQ_API_KEY="your_groq_api_key"
+```
+
+8. Click `Deploy`.
+
+Streamlit Community Cloud documentation says you create the app from your workspace, choose the repository, branch, and file path, and can set both Python version and secrets in `Advanced settings` before deployment. Sources: [Streamlit deploy overview](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app), [Streamlit deploy steps](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy).
+
+### Fallback: Render
+
+This repo includes [render.yaml](D:/monday-data-agent/render.yaml:1) for a Render deployment.
+
+Deployment steps:
+
+1. Push the repo to GitHub.
+2. In Render, create a new `Web Service`.
+3. Connect the GitHub repository.
+4. Use the included config or set:
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `streamlit run app.py --server.address 0.0.0.0 --server.port $PORT`
+5. Add these environment variables in Render:
+   - `MONDAY_API_TOKEN`
+   - `WORK_ORDER_BOARD_ID`
+   - `DEAL_FUNNEL_BOARD_ID`
+   - `GROQ_API_KEY`
+6. Deploy.
+
+Render's current docs say free web services are available, but they can spin down after 15 minutes of idle time, so this is better as a fallback demo option than the primary assignment submission path. Sources: [Render free web services](https://render.com/docs/free), [Render Streamlit guidance](https://render.com/articles/deploy-streamlit-gradio-localhost-to-live).
 
 ## Supported Question Types
 
@@ -179,7 +232,7 @@ The app handles:
 - Historical filtering depends on the available board date fields and uses best-effort date selection by metric type.
 - This is a read-only monday.com integration.
 - The agent is strongest on structured BI questions and less strong on completely open-ended strategic analysis.
-- Hosted deployment is not included in this repository.
+- Hosted deployment is not included in this repository until you deploy it to Streamlit Cloud or Render.
 
 ## Submission Notes
 
@@ -189,5 +242,7 @@ This repository contains:
 - tests
 - README
 - decision log
+- `.env.example`
+- `render.yaml`
 
 For final submission, package the repository as a ZIP and include the hosted prototype link separately.

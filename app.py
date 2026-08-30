@@ -21,12 +21,6 @@ st.set_page_config(
     layout="centered",
 )
 
-MENU_ICON = """
-<svg viewBox="0 0 24 24" aria-hidden="true">
-  <path d="M3 6.5h18M3 12h18M3 17.5h18" />
-</svg>
-"""
-
 HISTORY_ICON = """
 <svg viewBox="0 0 24 24" aria-hidden="true">
   <path d="M4 12a8 8 0 1 0 2.4-5.7" />
@@ -1342,14 +1336,7 @@ st.markdown("<div class='topbar-shell'>", unsafe_allow_html=True)
 topbar_columns = st.columns([1, 4, 1])
 
 with topbar_columns[0]:
-    st.markdown(
-        html_block(
-            f"""
-<div class="topbar-icon">{MENU_ICON}</div>
-"""
-        ),
-        unsafe_allow_html=True,
-    )
+    st.empty()
 
 with topbar_columns[1]:
     st.markdown(
