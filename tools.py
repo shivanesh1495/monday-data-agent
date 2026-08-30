@@ -182,6 +182,7 @@ def cross_reference_deal_to_execution(
     deals_df,
     work_orders_df,
     sector=None,
+    time_window=None,
 ):
     """
     Compare deal pipeline and work-order execution
@@ -193,6 +194,7 @@ def cross_reference_deal_to_execution(
 
     return {
         "sector": sector or "All sectors",
+        "requested_time_window": time_window,
         "pipeline": deal_data,
         "execution": work_data,
         "comparison": {

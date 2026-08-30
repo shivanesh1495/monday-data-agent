@@ -96,15 +96,39 @@ def detect_sector(question):
     Returns None if no unambiguous sector is present.
     """
 
+    sectors = detect_sectors(question)
+    return sectors[0] if len(sectors) == 1 else None
+
+
+def detect_sectors(question):
+    """Return every known sector mentioned in a message, in canonical form."""
+
     question_lower = question.lower()
-    matches = []
-
+    aliases = {"Renewables": ["renewables", "renewable"]}
+    detected = []
     for sector in KNOWN_SECTORS:
-        if re.search(rf"\b{re.escape(sector.lower())}\b", question_lower):
-            matches.append(sector)
+        names = aliases.get(sector, [sector.lower()])
+        if any(re.search(rf"\b{re.escape(name)}\b", question_lower) for name in names):
+            detected.append(sector)
+    return detected
 
-    if len(matches) == 1:
-        return matches[0]
+
+def detect_time_window(question):
+    """Extract a supported conversational time-window label, if present."""
+
+    question_lower = question.lower().replace("-", " ")
+    patterns = {
+        "last_month": r"\blast\s+month\b",
+        "this_month": r"\bthis\s+month\b",
+        "last_quarter": r"\blast\s+quarter\b",
+        "this_quarter": r"\bthis\s+quarter\b",
+        "this_year": r"\bthis\s+year\b",
+        "last_year": r"\blast\s+year\b",
+    }
+
+    for label, pattern in patterns.items():
+        if re.search(pattern, question_lower):
+            return label
 
     return None
 
@@ -121,6 +145,48 @@ def is_cross_reference_question(question):
     has_execution = any(word in q for word in execution_words)
 
     return has_comparison and has_deal and has_execution
+
+
+def is_metric_ambiguity(question):
+    question_lower = question.lower()
+    return "revenue" in question_lower and not any(
+        term in question_lower
+        for term in ["deal value", "billed", "collected", "receivable"]
+    )
+
+
+def format_cross_reference_result(payloads, time_window=None):
+    """Format deterministic cross-reference results without inventing values."""
+
+    lines = ["Sector comparison"]
+    if time_window:
+        lines.append(
+            f"Requested time window: {time_window.replace('_', ' ')}. "
+            "The current board tools return all available normalized records."
+        )
+
+    for payload in payloads:
+        result = payload["result"]
+        sector = result["sector"]
+        pipeline = result["pipeline"]
+        execution = result["execution"]
+        lines.extend(
+            [
+                "",
+                f"{sector}",
+                f"- Deal pipeline: {pipeline['total_deal_value']:,.2f} ({pipeline['deal_count']} deals)",
+                f"- Work-order execution: {execution['total_order_value']:,.2f} ({execution['work_order_count']} work orders)",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "Data quality: missing values were not imputed; see the underlying board fields for any incomplete records.",
+            "This is a sector-level comparison, not a direct one-to-one deal-to-work-order match.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def compact_quality_summary(summary):
@@ -187,11 +253,12 @@ def create_agent(
         result = work_order_financials(work_orders_df, sector=sector)
         return {"result": result, "quality": quality_context["work_orders"]}
 
-    def tool_cross_reference(sector=None):
+    def tool_cross_reference(sector=None, time_window=None):
         result = cross_reference_deal_to_execution(
             deals_df,
             work_orders_df,
             sector=sector,
+            time_window=time_window,
         )
         return {
             "result": result,
@@ -275,7 +342,11 @@ def create_agent(
                                 "Required sector name, such as Mining, Renewables, Railways, "
                                 "Powerline, Construction, or Others."
                             ),
-                        }
+                        },
+                        "time_window": {
+                            "type": "string",
+                            "description": "Requested period label, such as last_month."
+                        },
                     },
                     "required": ["sector"],
                 },
@@ -283,23 +354,74 @@ def create_agent(
         },
     ]
 
-    def ask(question):
-        cross_reference = is_cross_reference_question(question)
-        sector = detect_sector(question)
+    conversation_state = {
+        "sectors": [],
+        "comparison": None,
+        "metric": None,
+        "time_window": None,
+        "cross_reference_started": False,
+        "awaiting": None,
+    }
 
-        if cross_reference and not sector:
+    def ask(question):
+        current_sectors = detect_sectors(question)
+        for sector in current_sectors:
+            if sector not in conversation_state["sectors"]:
+                conversation_state["sectors"].append(sector)
+
+        if is_cross_reference_question(question):
+            conversation_state["cross_reference_started"] = True
+            conversation_state["comparison"] = "deal pipeline vs work-order execution"
+            conversation_state["metric"] = conversation_state["comparison"]
+
+        time_window = detect_time_window(question)
+        if time_window:
+            conversation_state["time_window"] = time_window
+
+        if is_metric_ambiguity(question):
+            conversation_state["awaiting"] = "metric"
             return (
-                "Which sector should I compare? Available sectors are: Mining, Renewables, "
-                "Railways, Powerline, Construction, and Others."
+                "Which metric do you mean: deal value, billed, collected, "
+                "or receivable?"
             )
 
-        if cross_reference and sector:
-            tool_choice = {
-                "type": "function",
-                "function": {"name": "cross_reference_deal_to_execution"},
-            }
-        else:
-            tool_choice = "auto"
+        if conversation_state["cross_reference_started"]:
+            if re.search(r"\ball\s+sectors?\b", question.lower()):
+                conversation_state["awaiting"] = "sector"
+                return (
+                    "I can compare sectors individually. Which sectors would you like me "
+                    "to compare? Available sectors are: Mining, Renewables, Railways, "
+                    "Powerline, Construction, and Others."
+                )
+
+            if not conversation_state["sectors"]:
+                conversation_state["awaiting"] = "sector"
+                return (
+                    "Which sector should I compare? Available sectors are: Mining, Renewables, "
+                    "Railways, Powerline, Construction, and Others."
+                )
+
+            if conversation_state["awaiting"] == "sector" and not time_window:
+                conversation_state["awaiting"] = "time_window"
+                return "What time period should I use?"
+
+            if conversation_state["awaiting"] == "time_window" and not time_window:
+                return "What time period should I use?"
+
+            conversation_state["awaiting"] = None
+            payloads = [
+                tool_cross_reference(
+                    sector=sector,
+                    time_window=conversation_state["time_window"],
+                )
+                for sector in conversation_state["sectors"]
+            ]
+            return format_cross_reference_result(
+                payloads,
+                conversation_state["time_window"],
+            )
+
+        tool_choice = "auto"
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -324,13 +446,6 @@ def create_agent(
         for tool_call in message.tool_calls:
             name = tool_call.function.name
             arguments = json.loads(tool_call.function.arguments)
-
-            if name == "cross_reference_deal_to_execution":
-                detected_sector = detect_sector(question)
-                if detected_sector:
-                    arguments["sector"] = detected_sector
-                if not arguments.get("sector"):
-                    raise ValueError("Cross-board comparison requires a sector.")
 
             if name not in functions:
                 raise ValueError(f"Unknown tool requested: {name}")
